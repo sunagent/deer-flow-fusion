@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+dist/
+build/
+
+# Local config and secrets
+.env
+config.yaml
+
+# Local CodeGraph state
+.codegraph/
+.deer-flow/
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*.gexf
+
+# Local datasets, model caches, and benchmark outputs
+datasets/
+benchmarks/datasets/
+benchmarks/results/
+benchmark-results/
+.cache/
+huggingface/
+repo-cache/
+codex-cache/
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

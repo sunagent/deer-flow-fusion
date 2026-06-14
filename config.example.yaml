@@ -1,0 +1,37 @@
+codegraph:
+  enabled: true
+
+  embedding:
+    provider: "local"
+    model_name: "jinaai/jina-embeddings-v2-base-code"
+    dimension: 768
+    cache_size: 10000
+
+  index:
+    workspace_root: null
+    supported_languages:
+      - python
+      - typescript
+      - javascript
+      - go
+      - rust
+      - java
+    chunk_max_lines: 200
+
+  storage:
+    persist_directory: ".codegraph"
+    vector_dtype: "float32"      # "int8" requires rebuilding the index
+    enable_embedding_cache: true
+
+  search:
+    default_top_k: 10
+    rrf_k: 60
+    enable_graph_search: true
+    enable_vector_search: true
+    enable_bm25: true
+    enable_rerank: true
+    rerank_top_k: 10
+    enable_nl_query_enhance: true
+    enable_context_prior: true
+    context_routing_mode: "language"
+    deterministic_sort: true
