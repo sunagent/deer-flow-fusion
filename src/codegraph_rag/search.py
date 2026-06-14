@@ -77,7 +77,8 @@ class SearchEngine:
             )
 
         # Step 2: 
-        # NL  search_document ?        semantic_results: list[SearchResult] = []
+        # NL queries prefer search_document; fallback to code vector when missing
+        semantic_results: list[SearchResult] = []
         if self._config.search.enable_vector_search and self._embedding.is_available:
             q_emb = self._embedding.get_embedding(search_query)
             if q_emb:
@@ -110,7 +111,8 @@ class SearchEngine:
                     language=routed_language,
                 )
 
-        # Step 4: ?+ RRF ?        has_graph = bool(graph_results)
+        # Step 4: RRF fusion across BM25 + vector + graph
+        has_graph = bool(graph_results)
         has_vector = bool(semantic_results)
         dwg, dwv, dwb = self._get_dynamic_weights(query)
 
@@ -697,7 +699,8 @@ class SearchEngine:
         results: list[SearchResult] = []
         seen_ids: set[str] = set()
 
-        # 1. ?        ql = query.lower()
+        # 1. Extract symbol candidates from query
+        ql = query.lower()
         symbol_candidates: set[str] = set()
         # camelCase
         for m in re.finditer(r"\b([a-z]+(?:[A-Z][a-z]+)+)\b", query):
@@ -774,7 +777,8 @@ class SearchEngine:
                     base_graph_score = 0.28 if is_prefix_candidate else 0.40
 
                 # 3. ?chunkymbols  file_path 
-                #  chunks  filesystem ?symbol_name ?                chunk = None
+                # Look up chunk by symbol_name in the chunks table (fallback chain)
+                chunk = None
                 from .models import CodeChunk, ChunkType as _CT
                 cur = self._storage._conn.execute(
                     "SELECT id, content, file_path, language, chunk_type, symbol_name, parent_symbol, start_line, end_line, tags, docstring FROM chunks WHERE symbol_name = ? LIMIT 1",
