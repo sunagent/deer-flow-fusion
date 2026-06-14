@@ -1,4 +1,5 @@
 """ ?BM25 +  + ?+ RRF """
+import hashlib
 import logging, re
 from pathlib import Path
 from .config import CodeGraphConfig
@@ -50,9 +51,11 @@ class SearchEngine:
         self, query: str, *, top_k: int | None = None,
         file_pattern: str | None = None, tags: list[str] | None = None,
         context: dict | None = None,
+        explain: bool = False,
     ) -> list[SearchResult]:
         top_k = top_k or self._config.search.default_top_k
         qtype = self._detect_query_type(query)
+        profile = self._detect_query_profile(query)
         routed_language = self._context_language(context) if (
             context
             and self._config.search.enable_context_prior
@@ -64,7 +67,7 @@ class SearchEngine:
             qtype == "nl" and self._config.search.enable_nl_query_enhance
         ) else query
 
-        # Step 1: BM25 
+        # Step 1: BM25
         bm25_results: list[SearchResult] = []
         if self._config.search.enable_bm25:
             bm25_results = self._storage.bm25_search(
@@ -76,7 +79,7 @@ class SearchEngine:
                 or_semantics=(qtype == "nl"),
             )
 
-        # Step 2: 
+        # Step 2: vector / document search
         # NL queries prefer search_document; fallback to code vector when missing
         semantic_results: list[SearchResult] = []
         if self._config.search.enable_vector_search and self._embedding.is_available:
@@ -99,7 +102,7 @@ class SearchEngine:
                 if tags:
                     semantic_results = self._filter_results(semantic_results, None, tags)
 
-        # Step 3: ?+ ?NL 
+        # Step 3: graph search (NL queries also benefit via inferred symbols)
         graph_results: list[SearchResult] = []
         if self._config.search.enable_graph_search:
             graph_results = self._graph_search(search_query, top_k=top_k * 2)
@@ -117,6 +120,7 @@ class SearchEngine:
         dwg, dwv, dwb = self._get_dynamic_weights(query)
 
         if has_graph and has_vector:
+            fusion_mode = "rrf_3way"
             fused = self._reciprocal_rank_fusion_3way(
                 bm25_results,
                 semantic_results,
@@ -129,6 +133,7 @@ class SearchEngine:
                 context=context,
             )
         elif has_vector:
+            fusion_mode = "rrf_2way_vector"
             fused = self._reciprocal_rank_fusion_2way(
                 bm25_results,
                 semantic_results,
@@ -141,6 +146,7 @@ class SearchEngine:
                 context=context,
             )
         elif has_graph:
+            fusion_mode = "rrf_2way_graph"
             fused = self._reciprocal_rank_fusion_2way(
                 bm25_results,
                 graph_results,
@@ -153,11 +159,46 @@ class SearchEngine:
                 context=context,
             )
         else:
-            fused = bm25_results[:top_k]
+            fusion_mode = "bm25_only"
+            fused = self._stable_sort_results(bm25_results)[:top_k]
 
         if self._reranker is not None and self._config.search.enable_rerank:
-            return self._apply_reranker(search_query, fused, context=context)
-        return fused
+            stage = "reranked"
+            final_results = self._apply_reranker(search_query, fused, context=context)
+        else:
+            stage = "fused"
+            final_results = fused
+
+        # Always normalize the final ordering with deterministic tiebreakers
+        final_results = self._stable_sort_results(final_results)
+
+        trace = self._build_explain_trace(
+            query=query,
+            search_query=search_query,
+            qtype=qtype,
+            profile=profile,
+            top_k=top_k,
+            file_pattern=file_pattern,
+            tags=tags,
+            context=context,
+            routed_language=routed_language,
+            weights=(dwg, dwv, dwb),
+            fusion_mode=fusion_mode,
+            stage=stage,
+            channel_counts={
+                "bm25": len(bm25_results),
+                "vector": len(semantic_results),
+                "graph": len(graph_results),
+                "fused": len(fused),
+                "final": len(final_results),
+            },
+        )
+        self._last_trace = trace
+
+        if explain:
+            self._attach_explain(final_results, trace)
+
+        return final_results
 
     @staticmethod
     def _normalize_language(value: str | None) -> str:
@@ -274,7 +315,7 @@ class SearchEngine:
             if match:
                 result.score += boost * match
                 result.channel_ranks["context"] = 1
-        return sorted(results, key=lambda r: r.score, reverse=True)
+        return self._stable_sort_results(results)
 
     # Semantic-to-symbol inference for NL queries
     _NL_STOP_WORDS = {
@@ -875,7 +916,7 @@ class SearchEngine:
             if len(results) >= top_k:
                 break
 
-        results.sort(key=lambda r: r.score, reverse=True)
+        results = self._stable_sort_results(results)
         return results[:top_k]
 
     #  RRF  
@@ -917,7 +958,10 @@ class SearchEngine:
                     scores[rid] = scores.get(rid, 0.0) + boost * match
                     result.channel_ranks["context"] = 1
 
-        sorted_ids = sorted(scores, key=scores.get, reverse=True)[:top_k]
+        sorted_ids = sorted(
+            scores,
+            key=lambda rid: self._stable_score_key(scores[rid], all_r.get(rid)),
+        )[:top_k]
         results = []
         for rid in sorted_ids:
             r = all_r.get(rid)
@@ -958,7 +1002,10 @@ class SearchEngine:
                     scores[rid] = scores.get(rid, 0.0) + boost * match
                     result.channel_ranks["context"] = 1
 
-        sorted_ids = sorted(scores, key=scores.get, reverse=True)[:top_k]
+        sorted_ids = sorted(
+            scores,
+            key=lambda rid: self._stable_score_key(scores[rid], all_r.get(rid)),
+        )[:top_k]
         results = []
         for rid in sorted_ids:
             r = all_r.get(rid)
@@ -1009,6 +1056,168 @@ class SearchEngine:
             # NL/Agent: keep RRF tail candidates for context pool
             output.extend(r for r in rrf_results if r.id not in used_ids)
         return output
+
+    # ---- Deterministic ordering helpers ----
+    @staticmethod
+    def _stable_result_key(result: SearchResult | None) -> tuple:
+        """Stable, content-derived secondary key for tiebreaking sort.
+
+        Falls back to a SHA1 of the result id so equal-score results land
+        in a deterministic order across runs and platforms.
+        """
+        if result is None:
+            return ("", 0, "", "")
+        rid = getattr(result, "id", "") or ""
+        digest = hashlib.sha1(rid.encode("utf-8", errors="replace")).hexdigest()
+        file_path = getattr(result, "file_path", "") or ""
+        line_number = getattr(result, "line_number", 0) or 0
+        symbol_name = getattr(result, "symbol_name", "") or ""
+        return (file_path, line_number, symbol_name, digest)
+
+    @classmethod
+    def _stable_score_key(cls, score: float, result: SearchResult | None) -> tuple:
+        """Ascending sort key: score DESC, then file/line/symbol/hash ASC.
+
+        Use this with ``sorted(..., key=...)`` (no ``reverse=True``).
+        """
+        file_path, line_number, symbol_name, digest = cls._stable_result_key(result)
+        return (-float(score), file_path, int(line_number), symbol_name, digest)
+
+    @classmethod
+    def _stable_sort_results(cls, results):
+        """Sort a list of SearchResult deterministically: score desc, then
+        file_path asc, line asc, symbol_name asc, sha1(id) asc."""
+        if not results:
+            return results
+        return sorted(
+            results,
+            key=lambda r: cls._stable_score_key(getattr(r, "score", 0.0) or 0.0, r),
+        )
+
+    def _index_snapshot_id(self) -> str:
+        """Short, stable identifier for the current index state.
+
+        Tries the storage `snapshot_id`/`signature`/`persist_directory` in
+        order and falls back to a hash of the storage class + dimension.
+        """
+        storage = getattr(self, "_storage", None)
+        for attr in ("snapshot_id", "signature", "fingerprint"):
+            v = getattr(storage, attr, None)
+            if callable(v):
+                try:
+                    v = v()
+                except Exception:
+                    v = None
+            if v:
+                return str(v)[:32]
+        cfg = getattr(self, "_config", None)
+        persist = ""
+        try:
+            persist = str(cfg.storage.persist_directory) if cfg else ""
+        except Exception:
+            pass
+        seed = f"{type(storage).__name__}|{persist}"
+        return hashlib.sha1(seed.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+    # ---- Explain trace builders ----
+    def _result_to_explain_dict(self, result: SearchResult, rank: int) -> dict:
+        """Convert a SearchResult into a JSON-friendly explain entry."""
+        return {
+            "rank": rank,
+            "id": getattr(result, "id", None),
+            "score": float(getattr(result, "score", 0.0) or 0.0),
+            "symbol": getattr(result, "symbol_name", None),
+            "qualified_name": getattr(result, "qualified_name", None),
+            "file_path": getattr(result, "file_path", None),
+            "line_number": getattr(result, "line_number", 0) or 0,
+            "language": getattr(result, "language", None),
+            "channel_ranks": dict(getattr(result, "channel_ranks", {}) or {}),
+            "tags": list(getattr(result, "tags", []) or []),
+        }
+
+    def _build_explain_trace(
+        self,
+        *,
+        query: str,
+        search_query: str,
+        qtype: str,
+        profile: str | None,
+        top_k: int,
+        file_pattern: str | None,
+        tags: list[str] | None,
+        context: dict | None,
+        routed_language: str | None,
+        weights: tuple,
+        fusion_mode: str,
+        stage: str,
+        channel_counts: dict,
+    ) -> dict:
+        wg, wv, wb = weights
+        cfg = self._config.search
+        return {
+            "engine": "codegraph_rag.search.SearchEngine",
+            "snapshot_id": self._index_snapshot_id(),
+            "query": query,
+            "search_query": search_query,
+            "query_type": qtype,
+            "query_profile": profile,
+            "top_k": top_k,
+            "file_pattern": file_pattern,
+            "tags": list(tags or []),
+            "context": dict(context or {}) if context else None,
+            "routed_language": routed_language,
+            "weights": {"graph": float(wg), "vector": float(wv), "bm25": float(wb)},
+            "rrf_k": getattr(cfg, "rrf_k", None),
+            "nl_rrf_k": getattr(cfg, "nl_rrf_k", None),
+            "fusion_mode": fusion_mode,
+            "stage": stage,
+            "channels": dict(channel_counts or {}),
+            "rerank_enabled": bool(getattr(cfg, "enable_rerank", False) and self._reranker is not None),
+            "context_prior_enabled": bool(getattr(cfg, "enable_context_prior", False)),
+        }
+
+    def _attach_explain(self, results, trace: dict) -> None:
+        """Attach trace metadata to each result.explain in-place."""
+        for rank, r in enumerate(results, 1):
+            entry = self._result_to_explain_dict(r, rank)
+            entry["trace"] = trace
+            try:
+                r.explain = entry
+            except Exception:
+                pass
+
+    def search_explain(
+        self,
+        query: str,
+        *,
+        top_k: int | None = None,
+        file_pattern: str | None = None,
+        tags: list[str] | None = None,
+        context: dict | None = None,
+    ) -> dict:
+        """Run search with deterministic ordering and return trace metadata.
+
+        Returns a dict shaped as:
+            {
+                "trace": {...},                # query routing/fusion summary
+                "results": [SearchResult, ...] # final stable-sorted results
+                "explain":  [{rank, id, ...}], # per-result explain entries
+            }
+        """
+        results = self.search(
+            query,
+            top_k=top_k,
+            file_pattern=file_pattern,
+            tags=tags,
+            context=context,
+            explain=True,
+        )
+        trace = getattr(self, "_last_trace", {}) or {}
+        return {
+            "trace": trace,
+            "results": results,
+            "explain": [self._result_to_explain_dict(r, i + 1) for i, r in enumerate(results)],
+        }
 
     def symbol_lookup(self, entity: str) -> list[SearchResult]:
         results = self._storage.bm25_search(entity, top_k=5)
