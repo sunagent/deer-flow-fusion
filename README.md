@@ -191,4 +191,4 @@ See [docs/deterministic-runtime.md](docs/deterministic-runtime.md).
 
 ## License
 
-MIT.
+Apache-2.0.

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Standalone local code RAG engine with Graph + Vector + BM25/FTS5 RRF fusion"
 readme = "README.md"
 requires-python = ">=3.12"
-license = "MIT"
+license = "Apache-2.0"
 authors = [
   { name = "CodeGraph RAG Contributors" }
 ]
