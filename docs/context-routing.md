@@ -1,6 +1,6 @@
 # Context Routing
 
-Date: 2026-06-14
+Date: 2026-06-15
 
 CodeGraph RAG owns retrieval routing and fusion. IDEs or AI programming clients
 only pass stable product facts:
@@ -78,7 +78,7 @@ Do not mix these RepoQA 500 result families:
 |---|---:|---:|---:|---:|---|
 | No context | 0.4930 | 40.0% | 67.4% | 85.4% | Pure query only |
 | Language/path/repo context | 0.6054 | 50.2% | 80.8% | 98.0% | Context soft prior |
-| Language-routed context | 0.6607 | 56.0% | 85.0% | 98.0% | Product-context path |
+| Language-routed context | 0.6607 | 56.0% | 85.0% | 98.0% | Product-context path, 62.5 ms avg |
 
 Use `Language-routed context` when the caller knows the active file, current
 language, or workspace, which is normal for an IDE/AI programming integration.

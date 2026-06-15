@@ -8,7 +8,7 @@ import logging
 import sqlite3
 import struct
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from .models import (
     ChunkType,
@@ -195,8 +195,9 @@ class CodeGraphStorage:
 
         persist_path.mkdir(parents=True, exist_ok=True)
         db_path = persist_path / "codegraph.db"
-        self._conn = sqlite3.connect(str(db_path))
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
 
         if self._vec_available and _vec_module is not None:
@@ -453,6 +454,12 @@ class CodeGraphStorage:
             self._conn.execute(
                 "DELETE FROM chunks WHERE file_path = ?", (file_path,)
             )
+
+    def list_indexed_files(self) -> list[str]:
+        cur = self._conn.execute(
+            "SELECT DISTINCT file_path FROM chunks ORDER BY file_path"
+        )
+        return [str(row[0]) for row in cur.fetchall()]
 
     def get_chunk_ids_by_file(self, file_path: str) -> list[str]:
         cur = self._conn.execute(
@@ -846,7 +853,9 @@ class CodeGraphStorage:
         return code_current, doc_current
 
     def embedding_work_items_for_file(
-        self, file_path: str
+        self,
+        file_path: str,
+        search_text_transform: Callable[[str], str] | None = None,
     ) -> list[dict[str, str | bool]]:
         """Return per-chunk embedding work needed for an indexed file.
 
@@ -865,15 +874,22 @@ class CodeGraphStorage:
         )
         items: list[dict[str, str | bool]] = []
         for chunk_id, content, search_text in cur.fetchall():
+            full_search_text = search_text or content or ""
+            doc_embedding_text = (
+                search_text_transform(full_search_text)
+                if search_text_transform
+                else full_search_text
+            )
             code_current, doc_current = self.get_embedding_cache_status(
-                chunk_id, content, search_text
+                chunk_id, content, doc_embedding_text
             )
             if not code_current or not doc_current:
                 items.append(
                     {
                         "chunk_id": chunk_id,
                         "content": content or "",
-                        "search_text": search_text or content or "",
+                        "search_text": full_search_text,
+                        "doc_embedding_text": doc_embedding_text,
                         "needs_code": not code_current,
                         "needs_doc": not doc_current,
                     }

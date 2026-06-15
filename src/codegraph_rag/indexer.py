@@ -65,13 +65,17 @@ class CodeGraphIndexer:
         # 1. 发现源码文件
         source_files = self._discover_files(root)
         logger.info(f"Discovered {len(source_files)} source files")
+        removed_files = self._remove_stale_indexed_files(root, source_files)
 
         # 2. 逐文件解析和存储
         total_chunks = 0
         total_symbols = 0
         total_calls = 0
+        total_code_embeddings = 0
+        total_doc_embeddings = 0
         all_symbols: list[SymbolIndex] = []
         all_calls: list = []
+        files_with_chunks: list[Path] = []
 
         for file_path in source_files:
             try:
@@ -81,9 +85,15 @@ class CodeGraphIndexer:
                 total_calls += len(calls)
                 all_symbols.extend(symbols)
                 all_calls.extend(calls)
+                if chunks:
+                    files_with_chunks.append(file_path)
                 self._indexed_files.add(str(file_path))
             except Exception as e:
                 logger.error(f"Failed to index {file_path}: {e}")
+
+        embed_stats = self.embed_files_incremental(files_with_chunks)
+        total_code_embeddings += int(embed_stats.get("code_embeddings", 0))
+        total_doc_embeddings += int(embed_stats.get("doc_embeddings", 0))
 
         self._last_symbols = all_symbols
         self._last_calls = all_calls
@@ -93,6 +103,9 @@ class CodeGraphIndexer:
             "chunks": total_chunks,
             "symbols": total_symbols,
             "calls": total_calls,
+            "code_embeddings": total_code_embeddings,
+            "doc_embeddings": total_doc_embeddings,
+            "removed_files": removed_files,
         }
         logger.info(f"Indexing complete: {stats}")
         return stats
@@ -109,6 +122,44 @@ class CodeGraphIndexer:
                 if ext in _SOURCE_EXTENSIONS:
                     files.append(Path(dirpath) / filename)
         return files
+
+    def _remove_stale_indexed_files(self, root: Path, source_files: list[Path]) -> int:
+        """Remove DB rows for files that disappeared from the workspace."""
+        try:
+            indexed_files = self._storage.list_indexed_files()
+        except Exception:
+            logger.debug("Unable to list indexed files for stale cleanup", exc_info=True)
+            return 0
+
+        root_key = self._file_key(root)
+        root_prefix = root_key if root_key.endswith(os.sep) else root_key + os.sep
+        source_keys = {self._file_key(path) for path in source_files}
+        removed = 0
+
+        for indexed_file in indexed_files:
+            indexed_path = Path(indexed_file)
+            indexed_key = self._file_key(indexed_path)
+            if indexed_key != root_key and not indexed_key.startswith(root_prefix):
+                continue
+            if indexed_key in source_keys and indexed_path.exists():
+                continue
+
+            self._storage.delete_chunks_by_file(indexed_file)
+            self._storage.delete_symbols_by_file(indexed_file)
+            self._embedding.invalidate(indexed_file)
+            self._indexed_files.discard(indexed_file)
+            removed += 1
+
+        if removed:
+            logger.info("Removed %s stale indexed files under %s", removed, root)
+        return removed
+
+    @staticmethod
+    def _file_key(path: str | Path) -> str:
+        try:
+            return str(Path(path).resolve()).casefold()
+        except OSError:
+            return str(Path(path).absolute()).casefold()
 
     def _index_file(self, file_path: Path) -> tuple[list[CodeChunk], list[SymbolIndex], list]:
         """索引单个文件：解析 → 提取 → 存储"""
@@ -153,17 +204,42 @@ class CodeGraphIndexer:
         file_path: str | Path,
         *,
         text_limit: int = 2048,
+        doc_text_limit: int = 1024,
+        batch_size: int = 32,
     ) -> dict[str, int]:
         """Embed only changed chunks for one indexed file.
 
         This is the product path for "save file -> update index": unchanged
         functions keep their existing code/search_document vectors by hash.
         """
+        return self.embed_files_incremental(
+            [file_path],
+            text_limit=text_limit,
+            doc_text_limit=doc_text_limit,
+            batch_size=batch_size,
+        )
+
+    def embed_files_incremental(
+        self,
+        file_paths: list[str | Path],
+        *,
+        text_limit: int = 2048,
+        doc_text_limit: int = 1024,
+        batch_size: int = 32,
+    ) -> dict[str, int]:
+        """Embed changed chunks for multiple indexed files in workspace batches."""
         if not self._embedding.is_available:
             return {"chunks": 0, "code_embeddings": 0, "doc_embeddings": 0}
 
-        file_path = Path(file_path)
-        items = self._storage.embedding_work_items_for_file(str(file_path))
+        items: list[dict[str, str | bool]] = []
+        for file_path in file_paths:
+            items.extend(
+                self._storage.embedding_work_items_for_file(
+                    str(Path(file_path)),
+                    search_text_transform=self._search_document_embedding_text,
+                )
+            )
+
         if not items:
             return {"chunks": 0, "code_embeddings": 0, "doc_embeddings": 0}
 
@@ -173,34 +249,42 @@ class CodeGraphIndexer:
             if bool(item["needs_code"])
         ]
         doc_rows = [
-            (str(item["chunk_id"]), str(item["search_text"])[:text_limit])
+            (str(item["chunk_id"]), str(item["doc_embedding_text"])[:doc_text_limit])
             for item in items
             if bool(item["needs_doc"])
         ]
 
-        if code_rows:
-            embeddings = self._embedding.get_embeddings_batch([text for _, text in code_rows])
-            self._storage.upsert_embeddings(
-                [
-                    (chunk_id, embedding)
-                    for (chunk_id, _), embedding in zip(code_rows, embeddings)
-                    if embedding is not None
-                ]
-            )
-        if doc_rows:
-            embeddings = self._embedding.get_embeddings_batch([text for _, text in doc_rows])
-            self._storage.upsert_document_embeddings(
-                [
-                    (chunk_id, embedding)
-                    for (chunk_id, _), embedding in zip(doc_rows, embeddings)
-                    if embedding is not None
-                ]
-            )
+        written_code_rows: list[tuple[str, list[float]]] = []
+        written_doc_rows: list[tuple[str, list[float]]] = []
+
+        for start in range(0, len(code_rows), batch_size):
+            batch = code_rows[start : start + batch_size]
+            embeddings = self._embedding.get_embeddings_batch([text for _, text in batch])
+            batch_written = [
+                (chunk_id, embedding)
+                for (chunk_id, _), embedding in zip(batch, embeddings)
+                if embedding is not None
+            ]
+            if batch_written:
+                self._storage.upsert_embeddings(batch_written)
+                written_code_rows.extend(batch_written)
+
+        for start in range(0, len(doc_rows), batch_size):
+            batch = doc_rows[start : start + batch_size]
+            embeddings = self._embedding.get_embeddings_batch([text for _, text in batch])
+            batch_written = [
+                (chunk_id, embedding)
+                for (chunk_id, _), embedding in zip(batch, embeddings)
+                if embedding is not None
+            ]
+            if batch_written:
+                self._storage.upsert_document_embeddings(batch_written)
+                written_doc_rows.extend(batch_written)
 
         rows_by_id = {
             str(item["chunk_id"]): (
                 str(item["content"]),
-                str(item["search_text"]),
+                str(item["doc_embedding_text"]),
             )
             for item in items
         }
@@ -221,9 +305,96 @@ class CodeGraphIndexer:
 
         return {
             "chunks": len(items),
-            "code_embeddings": len(code_rows),
-            "doc_embeddings": len(doc_rows),
+            "code_embeddings": len(written_code_rows),
+            "doc_embeddings": len(written_doc_rows),
         }
+
+    @staticmethod
+    def _search_document_embedding_text(search_text: str, *, limit: int = 1024) -> str:
+        """Build a compact NL vector input while keeping full search_document stored.
+
+        BM25 and the reranker still see the complete search document. The vector
+        channel only needs dense semantic hints, so avoid repeating absolute
+        paths, owner blocks, full AST boilerplate, and full code.
+        """
+        if not search_text:
+            return ""
+
+        keep_prefixes = (
+            "function summary:",
+            "function purpose:",
+            "function input:",
+            "function output:",
+            "function categories:",
+            "function module context:",
+            "language:",
+            "symbol:",
+            "symbol words:",
+            "symbol aliases:",
+            "parent:",
+            "signature:",
+            "parameters:",
+            "docstring:",
+            "comments:",
+            "tags:",
+        )
+        ast_keep_prefixes = (
+            "function kind:",
+            "inputs:",
+            "output type:",
+            "return behavior:",
+            "operators:",
+            "calls:",
+        )
+        kept: list[str] = []
+        in_ast = False
+        in_code = False
+        code_chars = 0
+        code_budget = 420
+
+        for raw in search_text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            lowered = line.lower()
+            if lowered == "code:":
+                in_code = True
+                in_ast = False
+                continue
+            if lowered == "ast summary:":
+                in_ast = True
+                in_code = False
+                continue
+            if in_code:
+                if code_chars == 0:
+                    kept.append("code excerpt:")
+                if code_chars < code_budget:
+                    kept.append(line[: max(0, code_budget - code_chars)])
+                    code_chars += len(line) + 1
+                continue
+            if in_ast:
+                if lowered.endswith(":") and lowered not in ast_keep_prefixes:
+                    in_ast = False
+                elif lowered.startswith(ast_keep_prefixes):
+                    if not lowered.endswith(":") and not lowered.endswith("false"):
+                        kept.append(line)
+                continue
+            if lowered.startswith(keep_prefixes):
+                if lowered.startswith(("function summary:", "function purpose:")):
+                    line = line[:240]
+                elif lowered.startswith("function module context:"):
+                    line = line[:160]
+                elif lowered.startswith(("symbol aliases:", "docstring:", "comments:")):
+                    line = line[:220]
+                elif len(line) > 260:
+                    line = line[:260]
+                kept.append(line)
+            if sum(len(part) + 1 for part in kept) >= limit:
+                break
+
+        if not kept:
+            return search_text[:limit]
+        return "\n".join(kept)[:limit]
 
     @staticmethod
     def extract_import_context(content: str, limit: int = 1200) -> str:

@@ -501,7 +501,7 @@ class SearchEngine:
     def _starts_like_code(first_line: str) -> bool:
         return bool(
             re.match(
-                r"^(def|class|import|from|return|if|for|while|try|except|function|const|let|var|public|private|fn|impl|package)\b",
+                r"^(@\w+|def|class|import|from|return|if|for|while|with|try|except|assert|raise|await|yield|lambda|function|const|let|var|public|private|fn|impl|package)\b",
                 first_line,
             )
         )
@@ -644,6 +644,8 @@ class SearchEngine:
         ):
             return "code"
 
+        if len(words) >= 5 and not re.search(r"[_(){};=]|::", query):
+            return "nl"
         if "_" in query:
             return "code"
         if re.search(r"[a-z][A-Z]", query):

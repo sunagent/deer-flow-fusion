@@ -39,3 +39,7 @@ codex-cache/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local recovery / backup files
+*.bak
+*.orig

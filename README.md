@@ -127,25 +127,39 @@ Cross-language search should be explicit:
 
 ## Benchmarks
 
-Current frozen-architecture retrieval results:
+Current frozen-package verification:
 
-| Benchmark | Samples | MRR | P@1 | Hit@10 | Avg Latency |
+| Check | Samples | MRR | P@1 | Hit@10 | Avg Latency |
 |---|---:|---:|---:|---:|---:|
-| CodeSearchNet full | 22,150 | 0.8095 | 76.66% | 86.28% | 671.3 ms |
-| CoIR-CCR | 14,918 | 0.9623 | 93.26% | 99.93% | 413.6 ms |
-| RepoQA 500, language-routed context | 500 | 0.6607 | 56.0% | 85.0% | 67.1 ms |
-| CodeNeedle-style memory | 3,000 | 0.8530 | 85.30% | 85.30% | 48.2 ms |
+| RepoQA 500, language-routed context | 500 | 0.6607 | 56.0% | 85.0% | 62.5 ms |
+| P1 smoke | 100 | 0.9650 | 96.0% | 97.0% | 32.2 ms |
+| P1 RAG, overall | 500 | 0.9710 | 97.0% | 97.2% | 31.5 ms |
+| P1 RAG, NL slice | 436 | 0.9736 | 97.25% | 97.48% | 32.0 ms |
+| P1 RAG, code slice | 64 | 0.9531 | 95.31% | 95.31% | 27.8 ms |
 
-SWE-bench Lite Astropy full-repo retrieval-only, 6 cases:
+Engineering verification for the real three-mode path:
 
-- Target file Hit@1: 83.33%
-- Target file Hit@3/5/10/30: 100%
-- Target hunk any Hit@5/10/30: 100%
-- Target hunk all-covered rate: 83.33%
+| Check | Result |
+|---|---:|
+| 10K-line full index time | 88.1 s |
+| Code embeddings | 10000 |
+| Document embeddings | 10000 |
+| Avg search latency | 27.4 ms |
+| 10-thread errors | 0 |
+| 10-thread P99 latency | 396.2 ms |
 
-These are retrieval metrics. They are not full SWE-bench repair resolve rates.
-See [docs/open-source-release.md](docs/open-source-release.md) for the complete
-metric boundary.
+Recent indexing optimization:
+
+- Full `search_document` text is still stored for BM25 and reranking.
+- Only the doc-vector embedding input is compacted for `chunk_doc_embeddings`.
+- 10K real three-mode build time dropped from `156.6s` to `88.1s`.
+- P1 smoke stayed flat or slightly better: `0.960 -> 0.965`.
+- P1 RAG 500 stayed effectively unchanged: `0.973 -> 0.971`, `P@1 97.2% -> 97.0%`.
+
+Historical large-benchmark results such as CodeSearchNet full, CoIR-CCR,
+CodeNeedle-style memory, and SWE-bench retrieval-only are kept in
+[docs/open-source-release.md](docs/open-source-release.md) with their metric
+boundary notes.
 
 ## Predictable Runtime
 

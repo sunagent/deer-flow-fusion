@@ -1,6 +1,6 @@
 # CodeGraph Open-Source Release Notes
 
-Date: 2026-06-14
+Date: 2026-06-15
 
 This document freezes the current CodeGraph retrieval architecture, benchmark
 boundaries, and open-source readiness notes for the standalone RAG release.
@@ -95,9 +95,9 @@ language/path/repo context when the caller is an IDE or AI coding client.
 
 | Case | MRR | P@1 | Hit@10 | Hit@150 | Misses | Avg ms |
 |---|---:|---:|---:|---:|---:|---:|
-| No context | 0.4930 | 40.0% | 67.4% | 85.4% | 73 | 128.8 |
+| No context | 0.4930 | 40.0% | 67.4% | 85.4% | 73 | 114.3 |
 | Language/path/repo context | 0.6054 | 50.2% | 80.8% | 98.0% | 10 | 128.0 |
-| Language-routed context | 0.6607 | 56.0% | 85.0% | 98.0% | 10 | 67.1 |
+| Language-routed context | 0.6607 | 56.0% | 85.0% | 98.0% | 10 | 62.5 |
 
 Use `Language-routed context` as the product-context number. Use `No context`
 only when comparing pure query-only behavior.
@@ -120,26 +120,58 @@ Pure NL description recall remains an optimization target.
 
 ## 5. Engineering Benchmarks
 
-Synthetic 100,000-line local project:
+Current verified three-mode path, including local Jina code vectors and local
+`search_document` vectors:
 
 | Item | Value |
 |---|---:|
-| Lines | 100,001 |
-| Files | 100 |
-| Functions | 14,243 |
-| Index time | 10.286 s |
-| Embedding time | 193.562 s |
-| Symbol search hit rate | 100% |
-| Symbol search avg / p99 | 64.6 ms / 88.0 ms |
-| NL search hit rate | 100% |
-| NL search avg / p99 | 90.9 ms / 132.0 ms |
-| Incremental single-file update | 1,998.2 ms |
-| Incremental recall after update | true |
-| Persistence reopen | 4,565.7 ms |
-| First search after restart | 66.0 ms |
-| Recall after restart | true |
-| 10-worker error rate / p99 | 0% / 495.4 ms |
-| 50-worker error rate / p99 | 0% / 2,585.7 ms |
+| 10K-line index time | 88.1 s |
+| Chunks | 10000 |
+| Symbols | 10000 |
+| Code embeddings | 10000 |
+| Search documents | 10000 |
+| Document embeddings | 10000 |
+| Memory after index | 2.40 GB |
+| Average search latency | 27.4 ms |
+| 10-thread error rate | 0% |
+| 10-thread P99 latency | 396.2 ms |
+| 1000-search memory delta | 0.000 GB |
+
+Profiling summary for the 10K run:
+
+| Stage | Time | Share |
+|---|---:|---:|
+| Model/storage init | 6.8 s | 7.8% |
+| Parse + chunk + symbols + normal SQLite writes | 3.7 s | 4.2% |
+| Code embedding | 8.9 s | 10.1% |
+| Search-document embedding | 58.3 s | 66.2% |
+| Code vector upsert | 4.8 s | 5.5% |
+| Document vector upsert | 4.7 s | 5.4% |
+| Embedding work-item lookup + cache mark | 0.6 s | <1% |
+| CallGraph attach | 0.3 s | <1% |
+
+Optimization applied on 2026-06-15:
+
+- Full `search_document` text remains stored for BM25/FTS5 and reranking.
+- Only the `chunk_doc_embeddings` input is compacted before local embedding.
+- Workspace indexing now batches doc/code embeddings across all files instead
+  of sending many small per-file batches.
+- 10K real three-mode build time improved from `156.6s` to `88.1s`.
+- Search-document embedding time improved from `127.1s` to `58.3s`.
+- Average doc-vector input shrank from about `1103` chars to about `591`.
+- Retrieval quality stayed effectively flat:
+  `P1 Smoke 100 MRR 0.960 -> 0.965`,
+  `P1 RAG 500 MRR 0.973 -> 0.971`,
+  `P1 RAG 500 P@1 97.2% -> 97.0%`.
+
+Current package verification after the indexing/routing/concurrency fixes:
+
+| Check | Samples | MRR | P@1 | Hit@10 | Zero Hits | Avg Latency |
+|---|---:|---:|---:|---:|---:|---:|
+| P1 smoke | 100 | 0.9650 | 96.0% | 97.0% | 3 | 32.2 ms |
+| P1 RAG, overall | 500 | 0.9710 | 97.0% | 97.2% | 14 | 31.5 ms |
+| P1 RAG, NL slice | 436 | 0.9736 | 97.25% | 97.48% | 11 | 32.0 ms |
+| P1 RAG, code slice | 64 | 0.9531 | 95.31% | 95.31% | 3 | 27.8 ms |
 
 Known product optimization targets:
 
@@ -246,4 +278,5 @@ Local benchmark artifacts used for this report:
 - `F:\codex-cache\benchmarks\REPOQA_500_CONTEXT_PRIOR_REPORT.md`
 - `F:\codex-cache\benchmarks\codeneedle_1000_current_results.json`
 - `F:\codex-cache\benchmarks\engineering_current_results.json`
+- `F:\codex-cache\benchmarks\p2_index_profile_10k_optimized.json`
 - `F:\codex-cache\benchmarks\swebench_fullrepo_retrieval_astropy_6_after_alias_summary.json`
