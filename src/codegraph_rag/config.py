@@ -63,7 +63,7 @@ class StorageConfig(BaseModel):
 class SearchConfig(BaseModel):
     """查询配置"""
 
-    default_top_k: int = Field(default=10, description="默认返回结果数")
+    default_top_k: int = Field(default=50, description="默认返回结果数")
     max_call_depth: int = Field(default=3, description="最大调用图递归深度")
     rrf_k: int = Field(default=60, description="RRF 融合常数")
     enable_graph_search: bool = Field(default=True, description="启用图检索")
@@ -76,7 +76,7 @@ class SearchConfig(BaseModel):
     weight_bm25: float = Field(default=0.1, description="BM25 关键词权重")
     merge_mode: Literal["rrf", "concat"] = Field(default="rrf", description="融合模式：rrf加权 / concat拼接")
     enable_rerank: bool = Field(default=True, description="Enable ReRanker v1 post-merge")
-    rerank_top_k: int = Field(default=10, description="P1 ReRanker 精排置顶候选数，NL/Agent 场景可设为 20")
+    rerank_top_k: int = Field(default=20, description="P1 ReRanker 精排置顶候选数")
     nl_rrf_k: int | None = Field(default=None, description="NL 查询专属 RRF k；null 表示沿用 rrf_k")
     enable_nl_query_enhance: bool = Field(default=True, description="启用纯英文 NL 查询规范化增强")
     enable_context_prior: bool = Field(default=True, description="启用语言/项目上下文先验；未传 context 时无影响")

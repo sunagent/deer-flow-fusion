@@ -38,6 +38,7 @@ class SearchEngine:
         self._graph_engine = graph_engine
         self._call_graph = call_graph or (graph_engine._call_graph if graph_engine and hasattr(graph_engine, "_call_graph") else None)
         self._expand_code_tokens = expand_code_tokens
+        self._context_doc_cache: dict[str, str] = {}
         self._reranker = None
         if config.search.enable_rerank:
             try:
@@ -164,7 +165,12 @@ class SearchEngine:
 
         if self._reranker is not None and self._config.search.enable_rerank:
             stage = "reranked"
-            final_results = self._apply_reranker(search_query, fused, context=context)
+            final_results = self._apply_reranker(
+                search_query,
+                fused,
+                context=context,
+                profile=profile,
+            )
         else:
             stage = "fused"
             final_results = fused
@@ -278,6 +284,69 @@ class SearchEngine:
             if len(t) >= 2
         }
 
+    def _context_has_specific(self, context: dict | None) -> bool:
+        if not context:
+            return False
+        if context.get("repo") or context.get("repository"):
+            return True
+        for key in ("path", "file_path", "active_file", "module", "package", "workspace"):
+            if self._context_tokens(context.get(key)):
+                return True
+        return False
+
+    def _context_surface_for_result(self, result: SearchResult) -> str:
+        """Return path-like text used by context-aware reranking.
+
+        Repo/path/module metadata may live in search_document even when the
+        indexed file path is synthetic. Cache lookups because this runs for
+        every candidate in RRF/P1.
+        """
+        rid = getattr(result, "id", "") or ""
+        search_document = ""
+        if rid:
+            if rid in self._context_doc_cache:
+                search_document = self._context_doc_cache[rid]
+            else:
+                try:
+                    search_document = self._storage.get_search_document(rid) or ""
+                except Exception:
+                    search_document = ""
+                if len(self._context_doc_cache) > 20000:
+                    self._context_doc_cache.clear()
+                self._context_doc_cache[rid] = search_document
+        return f"{getattr(result, 'file_path', '') or ''}\n{search_document}"
+
+    def _context_specific_match_score(self, result: SearchResult, context: dict | None) -> float:
+        """Score repo/path/module agreement without the language-only prior."""
+        if not context:
+            return 0.0
+
+        surface = self._context_surface_for_result(result)
+        surface_lower = surface.lower()
+        score = 0.0
+
+        wanted_repo = str(context.get("repo") or context.get("repository") or "").lower()
+        if wanted_repo and wanted_repo in surface_lower:
+            score += 0.45
+
+        ctx_tokens = set()
+        for key in ("path", "file_path", "active_file", "module", "package", "workspace"):
+            ctx_tokens.update(self._context_tokens(context.get(key)))
+        ctx_tokens = {
+            token
+            for token in ctx_tokens
+            if token not in {"src", "lib", "test", "tests", "main", "index", "code", "repo"}
+        }
+        if ctx_tokens:
+            surface_tokens = self._context_tokens(surface)
+            if surface_tokens:
+                score += min(
+                    0.55,
+                    0.55 * len(ctx_tokens & surface_tokens) / max(min(len(ctx_tokens), 8), 1),
+                )
+
+        return min(score, 1.0)
+
     def _context_match_score(self, result: SearchResult, context: dict | None) -> float:
         if not context:
             return 0.0
@@ -288,19 +357,9 @@ class SearchEngine:
             wanted_lang = self._language_from_path(context.get("active_file") or context.get("file_path") or context.get("path"))
         result_lang = self._normalize_language(getattr(result, "language", None)) or self._language_from_path(result.file_path)
         if self._language_matches(wanted_lang, result_lang):
-            score += 0.60
+            score += 0.55
 
-        wanted_repo = str(context.get("repo") or context.get("repository") or "").lower()
-        if wanted_repo and wanted_repo in (result.file_path or "").lower():
-            score += 0.20
-
-        ctx_tokens = set()
-        for key in ("path", "file_path", "active_file", "module", "package", "workspace"):
-            ctx_tokens.update(self._context_tokens(context.get(key)))
-        if ctx_tokens:
-            path_tokens = self._context_tokens(result.file_path)
-            if path_tokens:
-                score += min(0.20, 0.20 * len(ctx_tokens & path_tokens) / max(len(ctx_tokens), 1))
+        score += 0.45 * self._context_specific_match_score(result, context)
 
         return min(score, 1.0)
 
@@ -1017,10 +1076,20 @@ class SearchEngine:
         return results
 
     #   
-    def _apply_reranker(self, query: str, rrf_results, context: dict | None = None):
+    def _apply_reranker(
+        self,
+        query: str,
+        rrf_results,
+        context: dict | None = None,
+        profile: str | None = None,
+    ):
         if not rrf_results:
             return rrf_results
         nl_mode = self._detect_query_type(query) == "nl"
+        use_specific_context = (
+            self._context_has_specific(context)
+            and (profile or self._detect_query_profile(query)) == "function_memory"
+        )
         candidates = [
             {
                 'id': r.id,
@@ -1032,6 +1101,8 @@ class SearchEngine:
                 'tags': r.tags or [],
                 'channel_ranks': r.channel_ranks or {},
                 'context_match': self._context_match_score(r, context),
+                'context_specific_match': self._context_specific_match_score(r, context),
+                'context_has_specific': use_specific_context,
                 'context_boost': self._config.search.context_rerank_boost,
                 'search_document': self._storage.get_search_document(r.id) or '',
             }

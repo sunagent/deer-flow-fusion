@@ -59,14 +59,18 @@ Manual probes:
 
 ## RepoQA 500 Result
 
-Current verified frozen baseline with language-routed context:
+Current verified frozen baseline with language-routed context and
+context-aware P1 reranking:
 
 | Profile | MRR | P@1 | Hit@10 | Hit@150 | Misses | Avg ms |
 |---|---:|---:|---:|---:|---:|---:|
-| Stable dynamic router | 0.6714 | 57.8% | 85.8% | 98.8% | 6 | 69.8 |
+| Stable dynamic router + context-aware P1 | 0.8735 | 81.4% | 97.4% | 98.8% | 6 | 96.6 |
 
 Route self-check stays the same: RepoQA-style purpose/function-memory prompts
 remain on the graph-first profile instead of flipping into the issue profile.
+
+Runtime defaults are fixed at `default_top_k=50` and `rerank_top_k=20`.
+Top150 remains a benchmark/debug setting for recall headroom checks.
 
 ## Smoke Regression
 
@@ -82,10 +86,10 @@ Current package verification after routing, indexing, and concurrency fixes:
 
 | Benchmark | Samples | MRR | P@1 | Hit@10 | Zero hit | Avg ms |
 |---|---:|---:|---:|---:|---:|---:|
-| P1 smoke | 100 | 0.9650 | 96.0% | 97.0% | 3 | 32.2 |
-| P1 RAG overall | 500 | 0.9710 | 97.0% | 97.2% | 14 | 31.5 |
-| P1 RAG NL slice | 436 | 0.9736 | 97.25% | 97.48% | 11 | 32.0 |
-| P1 RAG code slice | 64 | 0.9531 | 95.31% | 95.31% | 3 | 27.8 |
+| P1 smoke | 100 | 0.9650 | 96.0% | 97.0% | 3 | 42.3 |
+| P1 RAG overall | 500 | 0.9710 | 97.0% | 97.2% | 14 | 37.7 |
+| P1 RAG NL slice | 436 | 0.9736 | 97.25% | 97.48% | 11 | 38.3 |
+| P1 RAG code slice | 64 | 0.9531 | 95.31% | 95.31% | 3 | 33.4 |
 
 ## Conclusion
 
@@ -105,5 +109,7 @@ Artifacts:
 - `F:\codex-cache\benchmarks\fixed_architecture_smoke_stable_router.log`
 - `F:\codex-cache\benchmarks\fixed_architecture_smoke_stable_router_rerun_20260614.log`
 - `F:\codex-cache\benchmarks\REPOQA_500_P0_P1_PROFILE_COMPARE.md`
+- `F:\codex-cache\benchmarks\repoqa_500_context_rerank_fixed_20260616.json`
+- `F:\codex-cache\benchmarks\REPOQA_500_RERANK_ROOT_CAUSE_FIX_20260616.md`
 - `F:\codex-cache\benchmarks\p1_smoke_100.py`
 - `F:\codex-cache\benchmarks\p1_rag_500.py`

@@ -24,13 +24,13 @@ codegraph:
     enable_embedding_cache: true
 
   search:
-    default_top_k: 10
+    default_top_k: 50
     rrf_k: 60
     enable_graph_search: true
     enable_vector_search: true
     enable_bm25: true
     enable_rerank: true
-    rerank_top_k: 10
+    rerank_top_k: 20
     enable_nl_query_enhance: true
     enable_context_prior: true
     context_routing_mode: "language"

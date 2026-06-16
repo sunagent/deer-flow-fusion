@@ -131,11 +131,15 @@ Current frozen-package verification:
 
 | Check | Samples | MRR | P@1 | Hit@10 | Avg Latency |
 |---|---:|---:|---:|---:|---:|
-| RepoQA 500, language-routed context | 500 | 0.6714 | 57.8% | 85.8% | 69.8 ms |
-| P1 smoke | 100 | 0.9650 | 96.0% | 97.0% | 32.2 ms |
-| P1 RAG, overall | 500 | 0.9710 | 97.0% | 97.2% | 31.5 ms |
-| P1 RAG, NL slice | 436 | 0.9736 | 97.25% | 97.48% | 32.0 ms |
-| P1 RAG, code slice | 64 | 0.9531 | 95.31% | 95.31% | 27.8 ms |
+| RepoQA 500, context-aware rerank | 500 | 0.8735 | 81.4% | 97.4% | 96.6 ms |
+| P1 smoke | 100 | 0.9650 | 96.0% | 97.0% | 42.3 ms |
+| P1 RAG, overall | 500 | 0.9710 | 97.0% | 97.2% | 37.7 ms |
+| P1 RAG, NL slice | 436 | 0.9736 | 97.25% | 97.48% | 38.3 ms |
+| P1 RAG, code slice | 64 | 0.9531 | 95.31% | 95.31% | 33.4 ms |
+
+Product retrieval defaults are fixed at `default_top_k=50` and
+`rerank_top_k=20`. Larger pools such as Top150 are reserved for benchmark and
+recall-bound diagnostics.
 
 Engineering verification for the real three-mode path:
 

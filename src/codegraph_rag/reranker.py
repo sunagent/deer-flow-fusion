@@ -491,6 +491,91 @@ class ReRanker:
             'rrf_prior': 0.00,
         },
     }
+    NL_SPECIFIC_CONTEXT_WEIGHTS_BY_LANGUAGE = {
+        # Specific repo/path/module context is highly reliable in IDE/agent
+        # workflows. This profile is only selected when that context exists;
+        # language-only context keeps the regular NL_CONTEXT profile.
+        "python": {
+            'func_name': 0.08,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.055,
+            'doc_overlap': 0.08,
+            'summary_overlap': 0.09,
+            'search_doc_overlap': 0.08,
+            'symbol_soft': 0.055,
+            'owner_match': 0.07,
+            'alias_match': 0.06,
+            'param_return': 0.06,
+            'channel_boost': 0.03,
+            'context_prior': 0.30,
+            'rrf_prior': 0.01,
+        },
+        "java": {
+            'func_name': 0.13,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.045,
+            'doc_overlap': 0.07,
+            'summary_overlap': 0.08,
+            'search_doc_overlap': 0.075,
+            'symbol_soft': 0.105,
+            'owner_match': 0.055,
+            'alias_match': 0.04,
+            'param_return': 0.04,
+            'channel_boost': 0.03,
+            'context_prior': 0.30,
+            'rrf_prior': 0.00,
+        },
+        "typescript": {
+            'func_name': 0.08,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.045,
+            'doc_overlap': 0.08,
+            'summary_overlap': 0.13,
+            'search_doc_overlap': 0.115,
+            'symbol_soft': 0.05,
+            'owner_match': 0.05,
+            'alias_match': 0.03,
+            'param_return': 0.05,
+            'channel_boost': 0.03,
+            'context_prior': 0.30,
+            'rrf_prior': 0.01,
+        },
+        "javascript": {
+            'func_name': 0.08,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.045,
+            'doc_overlap': 0.08,
+            'summary_overlap': 0.13,
+            'search_doc_overlap': 0.115,
+            'symbol_soft': 0.05,
+            'owner_match': 0.05,
+            'alias_match': 0.03,
+            'param_return': 0.05,
+            'channel_boost': 0.03,
+            'context_prior': 0.30,
+            'rrf_prior': 0.01,
+        },
+        "go": {
+            'func_name': 0.13,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.045,
+            'doc_overlap': 0.07,
+            'summary_overlap': 0.08,
+            'search_doc_overlap': 0.075,
+            'symbol_soft': 0.105,
+            'owner_match': 0.055,
+            'alias_match': 0.04,
+            'param_return': 0.04,
+            'channel_boost': 0.03,
+            'context_prior': 0.30,
+            'rrf_prior': 0.00,
+        },
+    }
     # Code-oriented weights (for symbol-bearing queries)
     CODE_WEIGHTS = {'func_name': 0.25, 'import_match': 0.20, 'ast_struct': 0.25, 'token_overlap': 0.20, 'rrf_prior': 0.10}
 
@@ -595,13 +680,21 @@ class ReRanker:
         # F10: Optional workspace context prior. The caller may know active
         # language/repo/path; use it as a soft boost, never as a hard filter.
         context_match = float((candidate or {}).get('context_match') or 0.0)
+        context_specific = float((candidate or {}).get('context_specific_match') or 0.0)
+        context_source = context_specific if (candidate or {}).get('context_has_specific') else context_match
         context_boost = float((candidate or {}).get('context_boost') or 0.0)
-        scores['context_prior'] = min(1.0, max(0.0, context_match * context_boost * 10.0))
+        scores['context_prior'] = min(1.0, max(0.0, context_source * context_boost * 10.0))
 
         # Weighted sum — auto-select NL vs Code weights
         has_context = bool((candidate or {}).get('context_match'))
         if nl_mode and has_context:
-            weights = self.NL_CONTEXT_WEIGHTS_BY_LANGUAGE.get(feat.language, self.NL_CONTEXT_WEIGHTS)
+            if (candidate or {}).get('context_has_specific'):
+                weights = self.NL_SPECIFIC_CONTEXT_WEIGHTS_BY_LANGUAGE.get(
+                    feat.language,
+                    self.NL_CONTEXT_WEIGHTS,
+                )
+            else:
+                weights = self.NL_CONTEXT_WEIGHTS_BY_LANGUAGE.get(feat.language, self.NL_CONTEXT_WEIGHTS)
         else:
             weights = self.NL_WEIGHTS if nl_mode else self.CODE_WEIGHTS
         final = sum(weights[k] * scores[k] for k in weights)

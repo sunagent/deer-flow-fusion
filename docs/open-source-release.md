@@ -97,15 +97,19 @@ language/path/repo context when the caller is an IDE or AI coding client.
 |---|---:|---:|---:|---:|---:|---:|
 | No context | 0.4930 | 40.0% | 67.4% | 85.4% | 73 | 114.3 |
 | Language/path/repo context | 0.6054 | 50.2% | 80.8% | 98.0% | 10 | 128.0 |
-| Language-routed context | 0.6714 | 57.8% | 85.8% | 98.8% | 6 | 69.8 |
+| Language-routed context, context-aware P1 | 0.8735 | 81.4% | 97.4% | 98.8% | 6 | 96.6 |
 
-Use `Language-routed context` as the product-context number. Use `No context`
-only when comparing pure query-only behavior.
+Use `Language-routed context, context-aware P1` as the product-context number.
+Use `No context` only when comparing pure query-only behavior.
+
+Product defaults are `default_top_k=50` and `rerank_top_k=20`. Top150 is kept
+only for benchmark/debug runs that measure recall headroom.
 
 The current product-context number includes language-adaptive P1 reranker
-weights for RepoQA/SNF-style natural-language function lookup. The change keeps
-the frozen Graph + Vector + BM25 RRF policy intact and only adjusts the
-post-fusion lightweight reranker when caller language context is present.
+weights plus repo/path/module-aware context scoring for RepoQA/SNF-style
+natural-language function lookup. The change keeps the frozen Graph + Vector +
+BM25 RRF policy intact and only adjusts the post-fusion lightweight reranker
+when caller context is present.
 
 ### CodeNeedle-Style Memory Recall
 
@@ -254,8 +258,8 @@ Cross-language search should be explicit:
   exists in the benchmark path, but product-level parser depth still needs
   continued hardening for Java, TypeScript/JavaScript, Rust, and Go.
 - Pure natural-language reverse lookup is harder than code and symbol lookup.
-  RepoQA shows strong gains with language-routed context, but P@1 is still below
-  the symbol/signature path.
+  RepoQA now shows strong product-context performance when the caller provides
+  language plus repo/path/module context.
 - Full SWE-bench repair is out of scope for this retrieval release.
 - Benchmark datasets, generated indexes, and local model caches are not part of
   the source release.
@@ -281,6 +285,8 @@ Local benchmark artifacts used for this report:
 - `F:\codex-cache\benchmarks\coir_ccr_14918_current_results.json`
 - `F:\codex-cache\benchmarks\repoqa_500_context_prior_results.json`
 - `F:\codex-cache\benchmarks\REPOQA_500_CONTEXT_PRIOR_REPORT.md`
+- `F:\codex-cache\benchmarks\repoqa_500_context_rerank_fixed_20260616.json`
+- `F:\codex-cache\benchmarks\REPOQA_500_RERANK_ROOT_CAUSE_FIX_20260616.md`
 - `F:\codex-cache\benchmarks\codeneedle_1000_current_results.json`
 - `F:\codex-cache\benchmarks\engineering_current_results.json`
 - `F:\codex-cache\benchmarks\p2_index_profile_10k_optimized.json`
