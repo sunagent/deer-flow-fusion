@@ -61,11 +61,45 @@ class CallGraph:
         """添加调用边到图中，自动规范化名称"""
         # 构建名称索引：简单名 → 全限定名列表
         name_index = self._name_index
+        normalize_cache: dict[str, str] = {}
+        suffix_index: dict[str, str] = {}
+        for node in self._graph.nodes:
+            parts = str(node).split(".")
+            for idx in range(len(parts)):
+                suffix = ".".join(parts[idx:])
+                suffix_index.setdefault(suffix, str(node))
+
+        def normalize(name: str) -> str:
+            cached = normalize_cache.get(name)
+            if cached is not None:
+                return cached
+
+            if name in self._graph:
+                normalized = name
+            else:
+                simple_name = name.split(".")[-1]
+                candidates = name_index.get(simple_name, [])
+                if len(candidates) == 1:
+                    normalized = candidates[0]
+                elif len(candidates) > 1:
+                    normalized = next(
+                        (
+                            candidate
+                            for candidate in candidates
+                            if name in candidate or candidate.endswith(f".{simple_name}")
+                        ),
+                        suffix_index.get(name, suffix_index.get(simple_name, name)),
+                    )
+                else:
+                    normalized = suffix_index.get(name, suffix_index.get(simple_name, name))
+
+            normalize_cache[name] = normalized
+            return normalized
 
         for call in calls:
             # 规范化 caller 和 callee
-            caller = self._normalize_name(call.caller, name_index)
-            callee = self._normalize_name(call.callee, name_index)
+            caller = normalize(call.caller)
+            callee = normalize(call.callee)
 
             # 确保节点存在
             if caller not in self._graph:

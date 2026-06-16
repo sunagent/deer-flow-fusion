@@ -190,42 +190,44 @@ def _make_chunk_id(file_path: str, symbol_name: str, start_line: int, end_line: 
 # ── Main entry point ──
 
 
-def parse_file(file_path: str, content: str, language: str) -> list[CodeChunk]:
-    """Parse a source file and return a list of CodeChunk objects.
-
-    *file_path* is used for chunk IDs and metadata only; the actual source
-    text is taken from *content*.  *language* should be a key in
-    LANGUAGE_MAP values (e.g. ``"python"``).
-
-    If tree-sitter is not available, returns an empty list with a warning.
-    """
+def parse_source(file_path: str, content: str, language: str) -> tuple[object, bytes] | None:
+    """Parse source once and return a reusable tree/source pair."""
     ext = _ext_from_language(language)
     if ext is None:
         # Try reverse lookup from file_path
         ext = PurePosixPath(file_path).suffix
         if ext not in LANGUAGE_MAP:
             logger.warning("Unsupported language '%s' for file '%s'", language, file_path)
-            return []
+            return None
 
     if language in TEXT_LIKE_LANGUAGES:
-        return _chunk_text_like_file(file_path, content, language)
+        return None
 
     lang = get_language(ext)
     if lang is None:
-        logger.warning("Cannot load tree-sitter for '%s'; returning empty chunks", language)
-        return []
+        logger.warning("Cannot load tree-sitter for '%s'; returning empty parse", language)
+        return None
 
     try:
         from tree_sitter import Parser
     except ImportError:
-        logger.warning("tree-sitter Parser not available; returning empty chunks")
-        return []
+        logger.warning("tree-sitter Parser not available; returning empty parse")
+        return None
 
     source_bytes = content.encode("utf-8")
     parser = Parser()
     parser.language = lang  # type: ignore[assignment]
     tree = parser.parse(source_bytes)
+    return tree, source_bytes
 
+
+def chunks_from_tree(
+    file_path: str,
+    language: str,
+    tree: object,
+    source_bytes: bytes,
+) -> list[CodeChunk]:
+    """Build chunks from an already parsed tree."""
     root = tree.root_node
     chunkers: dict[str, object] = {
         "python": _chunk_python,
@@ -248,6 +250,24 @@ def parse_file(file_path: str, content: str, language: str) -> list[CodeChunk]:
         chunk.tags = _extract_tags(chunk)
 
     return chunks
+
+
+def parse_file(file_path: str, content: str, language: str) -> list[CodeChunk]:
+    """Parse a source file and return a list of CodeChunk objects.
+
+    *file_path* is used for chunk IDs and metadata only; the actual source
+    text is taken from *content*.  *language* should be a key in
+    LANGUAGE_MAP values (e.g. ``"python"``).
+
+    If tree-sitter is not available, returns an empty list with a warning.
+    """
+    if language in TEXT_LIKE_LANGUAGES:
+        return _chunk_text_like_file(file_path, content, language)
+    parsed = parse_source(file_path, content, language)
+    if parsed is None:
+        return []
+    tree, source_bytes = parsed
+    return chunks_from_tree(file_path, language, tree, source_bytes)
 
 
 # ── Per-language chunkers ──

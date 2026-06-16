@@ -1095,6 +1095,16 @@ def extract_symbols(file_path: str, content: str, language: str) -> list[SymbolI
         return []
 
     tree, source_bytes = _parse_tree(content, language)
+    return extract_symbols_from_tree(file_path, language, tree, source_bytes)
+
+
+def extract_symbols_from_tree(
+    file_path: str,
+    language: str,
+    tree: object | None,
+    source_bytes: bytes,
+) -> list[SymbolIndex]:
+    """Extract symbol definitions from an already parsed tree."""
     if tree is None:
         return []
 
@@ -1116,6 +1126,17 @@ def extract_calls(
         return []
 
     tree, source_bytes = _parse_tree(content, language)
+    return extract_calls_from_tree(file_path, language, tree, source_bytes, symbols)
+
+
+def extract_calls_from_tree(
+    file_path: str,
+    language: str,
+    tree: object | None,
+    source_bytes: bytes,
+    symbols: list[SymbolIndex],
+) -> list[CallEdge]:
+    """Extract call edges from an already parsed tree."""
     if tree is None:
         return []
 

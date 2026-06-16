@@ -8,12 +8,15 @@ import re
 from pathlib import Path
 from typing import Callable
 
-from .chunker import parse_file
+from .chunker import chunks_from_tree, parse_file, parse_source
 from .config import CodeGraphConfig
 from .embedding import EmbeddingCache, create_provider
 from .models import CodeChunk, SymbolIndex
 from .storage import CodeGraphStorage
-from .symbol_extractor import extract_calls, extract_symbols
+from .symbol_extractor import (
+    extract_calls_from_tree,
+    extract_symbols_from_tree,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,13 +175,20 @@ class CodeGraphIndexer:
         language = self._detect_language(file_path)
 
         # 1. AST 分块
-        chunks = parse_file(str(file_path), content, language)
+        parsed = parse_source(str(file_path), content, language)
+        if parsed is None:
+            chunks = parse_file(str(file_path), content, language)
+            symbols = []
+            calls = []
+        else:
+            tree, source_bytes = parsed
+            chunks = chunks_from_tree(str(file_path), language, tree, source_bytes)
 
         # 2. 符号提取
-        symbols = extract_symbols(str(file_path), content, language)
+            symbols = extract_symbols_from_tree(str(file_path), language, tree, source_bytes)
 
         # 3. 调用关系提取
-        calls = extract_calls(str(file_path), content, language, symbols)
+            calls = extract_calls_from_tree(str(file_path), language, tree, source_bytes, symbols)
 
         # 4. 存储入库
         old_chunk_ids = set(self._storage.get_chunk_ids_by_file(str(file_path)))
@@ -534,7 +544,7 @@ class CodeGraphIndexer:
         symbol: SymbolIndex | None,
     ) -> str:
         """Extract owner/package/export/trait context for function-level NL retrieval."""
-        content = chunk.content
+        content = chunk.content[:12000]
         language = chunk.language
         lines: list[str] = []
         if symbol:
@@ -945,7 +955,11 @@ class CodeGraphIndexer:
 
     @classmethod
     def build_search_document(
-        cls, chunk: CodeChunk, symbol: SymbolIndex | None = None
+        cls,
+        chunk: CodeChunk,
+        symbol: SymbolIndex | None = None,
+        *,
+        module_ctx: str | None = None,
     ) -> str:
         """生成面向自然语言查询的 search_document。
 
@@ -956,6 +970,7 @@ class CodeGraphIndexer:
         parent_words = cls._split_identifier(chunk.parent_symbol)
         docstring = (chunk.docstring or "").strip()
         signature = symbol.signature if symbol and symbol.signature else ""
+        analysis_content = chunk.content[:12000]
         param_parts = []
         if symbol:
             for param in symbol.parameters:
@@ -963,13 +978,13 @@ class CodeGraphIndexer:
                 if param.type_annotation:
                     text += f" {param.type_annotation}"
                 param_parts.append(text)
-        comments = cls._extract_comments(chunk.content)
-        semantic_tags = cls._semantic_tags(chunk.content, chunk.tags)
-        module_ctx = cls.module_context(chunk.file_path)
-        import_ctx = cls.extract_import_context(chunk.content)
-        ast_summary = cls._ast_summary(chunk.content, symbol)
+        comments = cls._extract_comments(analysis_content)
+        semantic_tags = cls._semantic_tags(analysis_content, chunk.tags)
+        module_ctx = module_ctx if module_ctx is not None else cls.module_context(chunk.file_path)
+        import_ctx = cls.extract_import_context(analysis_content)
+        ast_summary = cls._ast_summary(analysis_content, symbol)
         owner_ctx = cls._owner_context(chunk, symbol)
-        alias_ctx = cls._symbol_alias_context(symbol_name, chunk.language, chunk.content)
+        alias_ctx = cls._symbol_alias_context(symbol_name, chunk.language, analysis_content)
         function_summary = cls._function_summary(
             chunk,
             symbol,
@@ -1006,10 +1021,24 @@ class CodeGraphIndexer:
     def _build_search_documents(
         self, chunks: list[CodeChunk], symbols: list[SymbolIndex]
     ) -> list[tuple[str, str]]:
+        by_file_and_name: dict[tuple[str, str], SymbolIndex] = {}
+        by_name: dict[str, SymbolIndex] = {}
+        for symbol in symbols:
+            by_file_and_name.setdefault((symbol.file_path, symbol.name), symbol)
+            by_name.setdefault(symbol.name, symbol)
+        module_ctx_cache: dict[str, str] = {}
         docs = []
         for chunk in chunks:
-            symbol = self._symbol_for_chunk(chunk, symbols)
-            docs.append((chunk.id, self.build_search_document(chunk, symbol)))
+            symbol = None
+            if chunk.symbol_name:
+                symbol = by_file_and_name.get((chunk.file_path, chunk.symbol_name))
+                if symbol is None:
+                    symbol = by_name.get(chunk.symbol_name)
+            module_ctx = module_ctx_cache.get(chunk.file_path)
+            if module_ctx is None:
+                module_ctx = self.module_context(chunk.file_path)
+                module_ctx_cache[chunk.file_path] = module_ctx
+            docs.append((chunk.id, self.build_search_document(chunk, symbol, module_ctx=module_ctx)))
         return docs
 
     @staticmethod

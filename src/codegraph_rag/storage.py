@@ -898,6 +898,74 @@ class CodeGraphStorage:
 
     # ── FTS5 BM25 搜索 ──
 
+    def cleanup_embedding_cache(
+        self,
+        *,
+        remove_orphans: bool = True,
+        max_age_days: int | None = None,
+        vacuum: bool = False,
+    ) -> dict[str, int | bool]:
+        """Clean stale embedding/cache rows without touching current chunks.
+
+        Default behavior is conservative: remove only rows whose chunk_id no
+        longer exists in `chunks`. Hash-mismatch rows are refreshed by the
+        normal embedding path, so this method does not delete them.
+        """
+        stats: dict[str, int | bool] = {
+            "orphan_code_embeddings": 0,
+            "orphan_doc_embeddings": 0,
+            "orphan_cache_rows": 0,
+            "expired_cache_rows": 0,
+            "vacuum": False,
+        }
+        with self._conn:
+            if remove_orphans:
+                if self._vec_available:
+                    cur = self._conn.execute(
+                        """
+                        DELETE FROM chunk_embeddings
+                        WHERE chunk_id NOT IN (SELECT id FROM chunks)
+                        """
+                    )
+                    stats["orphan_code_embeddings"] = int(
+                        cur.rowcount if cur.rowcount != -1 else 0
+                    )
+                    cur = self._conn.execute(
+                        """
+                        DELETE FROM chunk_doc_embeddings
+                        WHERE chunk_id NOT IN (SELECT id FROM chunks)
+                        """
+                    )
+                    stats["orphan_doc_embeddings"] = int(
+                        cur.rowcount if cur.rowcount != -1 else 0
+                    )
+                cur = self._conn.execute(
+                    """
+                    DELETE FROM chunk_embedding_cache
+                    WHERE chunk_id NOT IN (SELECT id FROM chunks)
+                    """
+                )
+                stats["orphan_cache_rows"] = int(
+                    cur.rowcount if cur.rowcount != -1 else 0
+                )
+
+            if max_age_days is not None and max_age_days > 0:
+                cur = self._conn.execute(
+                    """
+                    DELETE FROM chunk_embedding_cache
+                    WHERE updated_at < datetime('now', ?)
+                    """,
+                    (f"-{int(max_age_days)} days",),
+                )
+                stats["expired_cache_rows"] = int(
+                    cur.rowcount if cur.rowcount != -1 else 0
+                )
+
+        if vacuum:
+            self._conn.execute("VACUUM")
+            stats["vacuum"] = True
+        return stats
+
     def bm25_search(
         self,
         query: str,
