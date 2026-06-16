@@ -131,7 +131,7 @@ Current frozen-package verification:
 
 | Check | Samples | MRR | P@1 | Hit@10 | Avg Latency |
 |---|---:|---:|---:|---:|---:|
-| RepoQA 500, language-routed context | 500 | 0.6607 | 56.0% | 85.0% | 62.5 ms |
+| RepoQA 500, language-routed context | 500 | 0.6714 | 57.8% | 85.8% | 69.8 ms |
 | P1 smoke | 100 | 0.9650 | 96.0% | 97.0% | 32.2 ms |
 | P1 RAG, overall | 500 | 0.9710 | 97.0% | 97.2% | 31.5 ms |
 | P1 RAG, NL slice | 436 | 0.9736 | 97.25% | 97.48% | 32.0 ms |

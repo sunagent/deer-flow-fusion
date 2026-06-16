@@ -97,10 +97,15 @@ language/path/repo context when the caller is an IDE or AI coding client.
 |---|---:|---:|---:|---:|---:|---:|
 | No context | 0.4930 | 40.0% | 67.4% | 85.4% | 73 | 114.3 |
 | Language/path/repo context | 0.6054 | 50.2% | 80.8% | 98.0% | 10 | 128.0 |
-| Language-routed context | 0.6607 | 56.0% | 85.0% | 98.0% | 10 | 62.5 |
+| Language-routed context | 0.6714 | 57.8% | 85.8% | 98.8% | 6 | 69.8 |
 
 Use `Language-routed context` as the product-context number. Use `No context`
 only when comparing pure query-only behavior.
+
+The current product-context number includes language-adaptive P1 reranker
+weights for RepoQA/SNF-style natural-language function lookup. The change keeps
+the frozen Graph + Vector + BM25 RRF policy intact and only adjusts the
+post-fusion lightweight reranker when caller language context is present.
 
 ### CodeNeedle-Style Memory Recall
 

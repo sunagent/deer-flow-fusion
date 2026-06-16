@@ -49,6 +49,29 @@ def normalize_tokens(text: str | None, *, keep_stop_words: bool = False) -> set[
     return expanded
 
 
+def language_from_candidate(candidate: dict | None, file_path: str | None) -> str:
+    """Infer candidate language from search_document first, then file suffix."""
+    search_document = (candidate or {}).get("search_document") or ""
+    for line in search_document.splitlines()[:20]:
+        match = re.match(r"\s*language:\s*([A-Za-z0-9_+-]+)", line, flags=re.I)
+        if match:
+            lang = match.group(1).lower()
+            return "typescript" if lang in {"ts", "tsx"} else ("javascript" if lang in {"js", "jsx", "mjs"} else lang)
+
+    suffix = Path(file_path or "").suffix.lower()
+    return {
+        ".py": "python",
+        ".java": "java",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".mjs": "javascript",
+        ".rs": "rust",
+        ".go": "go",
+    }.get(suffix, "")
+
+
 def overlap_score(query_tokens: set[str], candidate_tokens: set[str]) -> float:
     if not query_tokens or not candidate_tokens:
         return 0.0
@@ -198,6 +221,7 @@ class CodeFeatures:
     summary_tokens: set[str]
     owner_tokens: set[str]
     alias_tokens: set[str]
+    language: str = ""
 
 def extract_imports(code: str) -> set[str]:
     """Extract imported library names from code."""
@@ -352,6 +376,7 @@ class ReRanker:
             summary_tokens=summary_tokens or sym.get('summary_tokens', set()),
             owner_tokens=owner_tokens_from_search_document((candidate or {}).get('search_document'), chunk_file),
             alias_tokens=alias_tokens_for_symbol(sym['name']),
+            language=language_from_candidate(candidate, chunk_file),
         )
 
     # NL-optimized weights (for docstring / natural language queries)
@@ -381,6 +406,90 @@ class ReRanker:
         'channel_boost': 0.04,
         'context_prior': 0.03,
         'rrf_prior': 0.01,
+    }
+    NL_CONTEXT_WEIGHTS_BY_LANGUAGE = {
+        # RepoQA/SNF-style pure NL lookup benefits from different signals by
+        # language. These profiles only apply when caller context is present.
+        "python": {
+            'func_name': 0.08,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.09,
+            'doc_overlap': 0.13,
+            'summary_overlap': 0.16,
+            'search_doc_overlap': 0.15,
+            'symbol_soft': 0.09,
+            'owner_match': 0.10,
+            'alias_match': 0.06,
+            'param_return': 0.06,
+            'channel_boost': 0.03,
+            'context_prior': 0.01,
+            'rrf_prior': 0.01,
+        },
+        "java": {
+            'func_name': 0.13,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.08,
+            'doc_overlap': 0.12,
+            'summary_overlap': 0.14,
+            'search_doc_overlap': 0.13,
+            'symbol_soft': 0.16,
+            'owner_match': 0.09,
+            'alias_match': 0.04,
+            'param_return': 0.04,
+            'channel_boost': 0.03,
+            'context_prior': 0.01,
+            'rrf_prior': 0.00,
+        },
+        "typescript": {
+            'func_name': 0.08,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.08,
+            'doc_overlap': 0.13,
+            'summary_overlap': 0.22,
+            'search_doc_overlap': 0.20,
+            'symbol_soft': 0.08,
+            'owner_match': 0.05,
+            'alias_match': 0.03,
+            'param_return': 0.05,
+            'channel_boost': 0.03,
+            'context_prior': 0.01,
+            'rrf_prior': 0.01,
+        },
+        "javascript": {
+            'func_name': 0.08,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.08,
+            'doc_overlap': 0.13,
+            'summary_overlap': 0.22,
+            'search_doc_overlap': 0.20,
+            'symbol_soft': 0.08,
+            'owner_match': 0.05,
+            'alias_match': 0.03,
+            'param_return': 0.05,
+            'channel_boost': 0.03,
+            'context_prior': 0.01,
+            'rrf_prior': 0.01,
+        },
+        "go": {
+            'func_name': 0.13,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.08,
+            'doc_overlap': 0.12,
+            'summary_overlap': 0.14,
+            'search_doc_overlap': 0.13,
+            'symbol_soft': 0.16,
+            'owner_match': 0.09,
+            'alias_match': 0.04,
+            'param_return': 0.04,
+            'channel_boost': 0.03,
+            'context_prior': 0.01,
+            'rrf_prior': 0.00,
+        },
     }
     # Code-oriented weights (for symbol-bearing queries)
     CODE_WEIGHTS = {'func_name': 0.25, 'import_match': 0.20, 'ast_struct': 0.25, 'token_overlap': 0.20, 'rrf_prior': 0.10}
@@ -491,7 +600,10 @@ class ReRanker:
 
         # Weighted sum — auto-select NL vs Code weights
         has_context = bool((candidate or {}).get('context_match'))
-        weights = self.NL_CONTEXT_WEIGHTS if (nl_mode and has_context) else (self.NL_WEIGHTS if nl_mode else self.CODE_WEIGHTS)
+        if nl_mode and has_context:
+            weights = self.NL_CONTEXT_WEIGHTS_BY_LANGUAGE.get(feat.language, self.NL_CONTEXT_WEIGHTS)
+        else:
+            weights = self.NL_WEIGHTS if nl_mode else self.CODE_WEIGHTS
         final = sum(weights[k] * scores[k] for k in weights)
         return final
 

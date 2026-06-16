@@ -63,7 +63,7 @@ Current verified frozen baseline with language-routed context:
 
 | Profile | MRR | P@1 | Hit@10 | Hit@150 | Misses | Avg ms |
 |---|---:|---:|---:|---:|---:|---:|
-| Stable dynamic router | 0.6607 | 56.0% | 85.0% | 98.0% | 10 | 62.5 |
+| Stable dynamic router | 0.6714 | 57.8% | 85.8% | 98.8% | 6 | 69.8 |
 
 Route self-check stays the same: RepoQA-style purpose/function-memory prompts
 remain on the graph-first profile instead of flipping into the issue profile.
