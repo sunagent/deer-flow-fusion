@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _hf_local_files_only() -> bool:
+    return os.getenv("HF_HUB_OFFLINE") == "1" or os.getenv("TRANSFORMERS_OFFLINE") == "1"
 
 
 class EmbeddingProvider(ABC):
@@ -42,7 +47,10 @@ class JinaCodeLocalProvider(EmbeddingProvider):
         try:
             from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(model_name, trust_remote_code=True)
+            kwargs: dict[str, Any] = {"trust_remote_code": True}
+            if _hf_local_files_only():
+                kwargs["local_files_only"] = True
+            self._model = SentenceTransformer(model_name, **kwargs)
             actual_dim = self._model.get_embedding_dimension()
             if actual_dim:
                 self._dimension = actual_dim
@@ -86,6 +94,7 @@ class JinaCodeLocalProvider(EmbeddingProvider):
             model_name,
             trust_remote_code=True,
             use_fast=False,
+            local_files_only=_hf_local_files_only(),
         )
 
         original_from_pretrained = transformers.AutoTokenizer.from_pretrained
@@ -93,11 +102,16 @@ class JinaCodeLocalProvider(EmbeddingProvider):
         def slow_tokenizer_from_pretrained(*args, **kwargs):
             kwargs.setdefault("trust_remote_code", True)
             kwargs.setdefault("use_fast", False)
+            kwargs.setdefault("local_files_only", _hf_local_files_only())
             return original_from_pretrained(*args, **kwargs)
 
         transformers.AutoTokenizer.from_pretrained = slow_tokenizer_from_pretrained
         try:
-            self._model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+            self._model = AutoModel.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                local_files_only=_hf_local_files_only(),
+            )
         finally:
             transformers.AutoTokenizer.from_pretrained = original_from_pretrained
 

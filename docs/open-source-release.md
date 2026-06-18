@@ -97,13 +97,15 @@ language/path/repo context when the caller is an IDE or AI coding client.
 |---|---:|---:|---:|---:|---:|---:|
 | No context | 0.4930 | 40.0% | 67.4% | 85.4% | 73 | 114.3 |
 | Language/path/repo context | 0.6054 | 50.2% | 80.8% | 98.0% | 10 | 128.0 |
-| Language-routed context, context-aware P1 | 0.8735 | 81.4% | 97.4% | 98.8% | 6 | 96.6 |
+| Language-routed context, context-aware P1 | 0.9199 | 86.8% | 98.8% | 98.8% | 6 | 101.2 |
 
 Use `Language-routed context, context-aware P1` as the product-context number.
 Use `No context` only when comparing pure query-only behavior.
 
-Product defaults are `default_top_k=50` and `rerank_top_k=20`. Top150 is kept
-only for benchmark/debug runs that measure recall headroom.
+Product defaults return `default_top_k=50` and rerank `rerank_top_k=20`.
+Ordinary queries use `candidate_pool_top_k=50`; function-memory queries with
+concrete repo/path/module context use `context_candidate_pool_top_k=150`
+internally, while still returning only Top50.
 
 The current product-context number includes language-adaptive P1 reranker
 weights plus repo/path/module-aware context scoring for RepoQA/SNF-style
@@ -177,10 +179,10 @@ Current package verification after the indexing/routing/concurrency fixes:
 
 | Check | Samples | MRR | P@1 | Hit@10 | Zero Hits | Avg Latency |
 |---|---:|---:|---:|---:|---:|---:|
-| P1 smoke | 100 | 0.9650 | 96.0% | 97.0% | 3 | 32.2 ms |
-| P1 RAG, overall | 500 | 0.9710 | 97.0% | 97.2% | 14 | 31.5 ms |
-| P1 RAG, NL slice | 436 | 0.9736 | 97.25% | 97.48% | 11 | 32.0 ms |
-| P1 RAG, code slice | 64 | 0.9531 | 95.31% | 95.31% | 3 | 27.8 ms |
+| P1 smoke | 100 | 0.9950 | 99.0% | 100.0% | 0 | 83.7 ms |
+| P1 RAG, overall | 500 | 0.9953 | 99.4% | 99.8% | 1 | 78.2 ms |
+| P1 RAG, NL slice | 436 | 0.9946 | 99.31% | 99.77% | 1 | 79.6 ms |
+| P1 RAG, code slice | 64 | 1.0000 | 100.0% | 100.0% | 0 | 68.8 ms |
 
 Known product optimization targets:
 
@@ -286,7 +288,9 @@ Local benchmark artifacts used for this report:
 - `F:\codex-cache\benchmarks\repoqa_500_context_prior_results.json`
 - `F:\codex-cache\benchmarks\REPOQA_500_CONTEXT_PRIOR_REPORT.md`
 - `F:\codex-cache\benchmarks\repoqa_500_context_rerank_fixed_20260616.json`
+- `F:\codex-cache\benchmarks\repoqa_500_rust_context_pool_fixed_20260616.json`
 - `F:\codex-cache\benchmarks\REPOQA_500_RERANK_ROOT_CAUSE_FIX_20260616.md`
+- `F:\codex-cache\benchmarks\RUST_RERANK_OPTIMIZATION_20260616.md`
 - `F:\codex-cache\benchmarks\codeneedle_1000_current_results.json`
 - `F:\codex-cache\benchmarks\engineering_current_results.json`
 - `F:\codex-cache\benchmarks\p2_index_profile_10k_optimized.json`

@@ -131,15 +131,17 @@ Current frozen-package verification:
 
 | Check | Samples | MRR | P@1 | Hit@10 | Avg Latency |
 |---|---:|---:|---:|---:|---:|
-| RepoQA 500, context-aware rerank | 500 | 0.8735 | 81.4% | 97.4% | 96.6 ms |
-| P1 smoke | 100 | 0.9650 | 96.0% | 97.0% | 42.3 ms |
-| P1 RAG, overall | 500 | 0.9710 | 97.0% | 97.2% | 37.7 ms |
-| P1 RAG, NL slice | 436 | 0.9736 | 97.25% | 97.48% | 38.3 ms |
-| P1 RAG, code slice | 64 | 0.9531 | 95.31% | 95.31% | 33.4 ms |
+| RepoQA 500, context-aware rerank | 500 | 0.9199 | 86.8% | 98.8% | 101.2 ms |
+| P1 smoke | 100 | 0.9950 | 99.0% | 100.0% | 83.7 ms |
+| P1 RAG, overall | 500 | 0.9953 | 99.4% | 99.8% | 78.2 ms |
+| P1 RAG, NL slice | 436 | 0.9946 | 99.31% | 99.77% | 79.6 ms |
+| P1 RAG, code slice | 64 | 1.0000 | 100.0% | 100.0% | 68.8 ms |
 
-Product retrieval defaults are fixed at `default_top_k=50` and
-`rerank_top_k=20`. Larger pools such as Top150 are reserved for benchmark and
-recall-bound diagnostics.
+Product retrieval returns `default_top_k=50` by default and uses
+`rerank_top_k=20`. Ordinary queries use an internal `candidate_pool_top_k=50`;
+function-memory queries with concrete repo/path/module context use
+`context_candidate_pool_top_k=150` internally to avoid premature truncation
+while still returning only Top50.
 
 Engineering verification for the real three-mode path:
 

@@ -28,6 +28,8 @@ _IGNORE_DIRS: set[str] = {
     "node_modules", ".git", "__pycache__", ".venv", "venv",
     ".tox", ".mypy_cache", ".pytest_cache", "dist", "build",
     ".codegraph", ".deer-flow", ".vector_store",
+    "vendor", "third_party", "third-party", "external", "deps",
+    "bower_components", ".next", ".nuxt", ".turbo", "coverage",
 }
 
 

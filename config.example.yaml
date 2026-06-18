@@ -25,6 +25,8 @@ codegraph:
 
   search:
     default_top_k: 50
+    candidate_pool_top_k: 50
+    context_candidate_pool_top_k: 150
     rrf_k: 60
     enable_graph_search: true
     enable_vector_search: true

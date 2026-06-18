@@ -490,6 +490,22 @@ class ReRanker:
             'context_prior': 0.01,
             'rrf_prior': 0.00,
         },
+        "rust": {
+            'func_name': 0.12,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.08,
+            'doc_overlap': 0.10,
+            'summary_overlap': 0.16,
+            'search_doc_overlap': 0.13,
+            'symbol_soft': 0.14,
+            'owner_match': 0.11,
+            'alias_match': 0.04,
+            'param_return': 0.04,
+            'channel_boost': 0.04,
+            'context_prior': 0.01,
+            'rrf_prior': 0.00,
+        },
     }
     NL_SPECIFIC_CONTEXT_WEIGHTS_BY_LANGUAGE = {
         # Specific repo/path/module context is highly reliable in IDE/agent
@@ -573,6 +589,22 @@ class ReRanker:
             'param_return': 0.04,
             'channel_boost': 0.03,
             'context_prior': 0.30,
+            'rrf_prior': 0.00,
+        },
+        "rust": {
+            'func_name': 0.11,
+            'import_match': 0.01,
+            'ast_struct': 0.02,
+            'token_overlap': 0.035,
+            'doc_overlap': 0.05,
+            'summary_overlap': 0.065,
+            'search_doc_overlap': 0.065,
+            'symbol_soft': 0.09,
+            'owner_match': 0.09,
+            'alias_match': 0.035,
+            'param_return': 0.04,
+            'channel_boost': 0.03,
+            'context_prior': 0.36,
             'rrf_prior': 0.00,
         },
     }
@@ -698,6 +730,152 @@ class ReRanker:
         else:
             weights = self.NL_WEIGHTS if nl_mode else self.CODE_WEIGHTS
         final = sum(weights[k] * scores[k] for k in weights)
+        if (candidate or {}).get('issue_mode'):
+            file_path = str((candidate or {}).get('file') or chunk_file or "").replace("\\", "/").lower()
+            symbol_name = str((candidate or {}).get('symbol_name') or "").lower()
+            tags = {str(tag).lower() for tag in ((candidate or {}).get('tags') or [])}
+            doc_blob = " ".join(
+                str(x or "").lower()
+                for x in (
+                    (candidate or {}).get('search_document'),
+                    (candidate or {}).get('docstring'),
+                )
+            )
+
+            is_test_candidate = (
+                file_path.startswith("test/")
+                or file_path.startswith("tests/")
+                or "/test/" in file_path
+                or "/tests/" in file_path
+                or Path(file_path).name.startswith("test_")
+                or file_path.endswith("_test.py")
+                or file_path.endswith(".test.js")
+                or file_path.endswith(".test.ts")
+                or symbol_name.startswith("test_")
+                or "test" in tags
+            )
+            if is_test_candidate:
+                final -= 0.060
+
+            # Implementation path prior: src/ lib/ controllers/ models/ etc.
+            impl_path_markers = (
+                "/src/", "src/", "/lib/", "lib/",
+                "/controllers/", "/controller/",
+                "/models/", "/model/",
+                "/services/", "/service/",
+                "/api/",
+                "/database/", "/db/",
+                "/socket.io/", "/sockets/",
+                "/user/", "/users/",
+                "/middleware/", "/middlewares/",
+            )
+            if any(marker in file_path for marker in impl_path_markers) and not is_test_candidate:
+                final += 0.025
+
+            # Issue-keyword priors. Two tiers per family:
+            #   * filename-stem hit: large boost (the actual gold filename).
+            #   * path-only hit: tiny boost (right neighbourhood, not target).
+            # This stops a generic config/ directory boost from drowning the
+            # specific gold file under siblings like configtypes/configutils.
+            issue_keywords = [
+                str(k).lower() for k in ((candidate or {}).get('issue_keywords') or [])
+            ]
+            file_name = Path(file_path).name if file_path else ""
+            file_stem = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
+
+            def _name_hits(*tokens: str) -> bool:
+                return any(t and t in file_name for t in tokens)
+
+            def _path_hits(*tokens: str) -> bool:
+                return any(t and t in file_path for t in tokens)
+
+            def _surface_hits(*tokens: str) -> bool:
+                return any(t and t in doc_blob for t in tokens)
+
+            if issue_keywords and not is_test_candidate:
+                kw_set = set(issue_keywords)
+
+                # --- config / settings ---
+                if {"config", "settings", "options"} & kw_set:
+                    if _name_hits("config", "settings"):
+                        final += 0.045
+                    elif _path_hits("/config/", "/settings/"):
+                        final += 0.012
+
+                # --- changelog / release-notes / version / upgrade / docs ---
+                if {"changelog", "release", "release_notes", "version", "upgrade", "docs", "documentation"} & kw_set:
+                    if file_name.endswith((".asciidoc", ".rst", ".md")) or _name_hits("changelog", "release_notes", "release-notes"):
+                        final += 0.06
+                    elif _path_hits("/doc/", "/docs/"):
+                        final += 0.015
+                    if _name_hits("version", "upgrade"):
+                        final += 0.025
+
+                # --- OpenAPI / JSON-schema ---
+                if {"openapi", "schema"} & kw_set:
+                    if _name_hits("openapi", "schema"):
+                        final += 0.05
+                    elif file_name.endswith((".yml", ".yaml", ".json")) and _path_hits("/openapi/", "/schemas/", "/schema/"):
+                        final += 0.04
+                    elif _path_hits("/openapi/", "/schemas/", "/schema/"):
+                        final += 0.012
+
+                # --- view / template ---
+                if {"template", "view", "ui"} & kw_set:
+                    if file_name.endswith(".tpl") or _name_hits("template", "view"):
+                        final += 0.04
+                    elif _path_hits("/views/", "/templates/", "/template/"):
+                        final += 0.012
+
+                # --- i18n / language ---
+                if {"i18n", "language", "translation"} & kw_set:
+                    if file_name.endswith(".json") and _path_hits("/language/", "/languages/", "/locales/", "/i18n/"):
+                        final += 0.045
+                    elif _path_hits("/language/", "/languages/", "/locales/", "/i18n/", "/translations/"):
+                        final += 0.012
+
+                # --- controller / router / route ---
+                if {"controller", "router", "route"} & kw_set:
+                    if _name_hits("controller", "router", "route"):
+                        final += 0.035
+                    elif _path_hits("/controllers/", "/routes/", "/router/"):
+                        final += 0.012
+
+                # --- database / migration ---
+                if {"database", "db", "migration"} & kw_set:
+                    if _name_hits("database", "migration") or file_stem in {"main", "index"}:
+                        # main.js / index.js inside a /database/ dir is a clear NodeBB-style multi-driver gold
+                        if _path_hits("/database/", "/db/", "/migrations/"):
+                            final += 0.045
+                    elif _path_hits("/database/", "/db/", "/migrations/"):
+                        final += 0.012
+
+                # --- socket / ws ---
+                if {"socket", "ws", "websocket"} & kw_set:
+                    if _path_hits("/socket.io/", "/sockets/", "/ws/"):
+                        final += 0.03
+
+                # --- email / mail ---
+                if {"email", "mail"} & kw_set:
+                    if _name_hits("email", "mail") or _name_hits("emailer"):
+                        final += 0.035
+                    elif _surface_hits("email", "mail"):
+                        final += 0.012
+
+            # Title-token bonus: lift candidates whose path/filename mention
+            # any non-trivial title word. Generic enough for arbitrary issues
+            # because we only scan tokens >=3 chars and skip stop words.
+            title_tokens = [
+                str(t).lower() for t in ((candidate or {}).get('issue_title_tokens') or [])
+            ]
+            if title_tokens and not is_test_candidate:
+                hits = sum(1 for t in title_tokens if t in file_path)
+                name_hits = sum(1 for t in title_tokens if t in file_name)
+                if name_hits:
+                    final += min(0.05, 0.025 * name_hits)
+                elif hits:
+                    final += min(0.025, 0.012 * hits)
+
         return final
 
     def rerank(self, query: str, candidates: list[dict], top_k: int = 10, nl_mode: bool = False) -> list[dict]:

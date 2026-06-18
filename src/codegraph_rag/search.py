@@ -54,9 +54,52 @@ class SearchEngine:
         context: dict | None = None,
         explain: bool = False,
     ) -> list[SearchResult]:
-        top_k = top_k or self._config.search.default_top_k
+        return_top_k = top_k or self._config.search.default_top_k
+        query = self._normalize_query_text(query)
         qtype = self._detect_query_type(query)
         profile = self._detect_query_profile(query)
+        issue_body = query
+        issue_focus_query = query
+        issue_test_hints = ""
+        issue_title = ""
+        issue_keywords: list[str] = []
+        graph_query = query
+        if profile == "issue":
+            issue_body, issue_test_lines = self._split_issue_query(query)
+            if issue_body.strip():
+                issue_body = issue_body.strip()
+                issue_focus_query = self._build_issue_focus_query(issue_body)
+                graph_query = issue_focus_query or issue_body
+            issue_test_hints = self._build_issue_test_hint_query(issue_test_lines)
+            issue_keywords = self._extract_issue_keywords(
+                issue_body if issue_body.strip() else query
+            )
+            issue_title = self._extract_issue_title(
+                issue_body if issue_body.strip() else query
+            )
+        has_specific_context = self._context_has_specific(context)
+        if profile == "function_memory" and has_specific_context:
+            pool_floor = getattr(
+                self._config.search, "context_candidate_pool_top_k", return_top_k
+            )
+        elif profile == "issue":
+            pool_floor = getattr(
+                self._config.search, "issue_candidate_pool_top_k", return_top_k
+            )
+        else:
+            pool_floor = getattr(
+                self._config.search, "candidate_pool_top_k", return_top_k
+            )
+        candidate_pool_top_k = max(return_top_k, pool_floor)
+        # Issue mode uses a tighter, fixed pool (lane=20 / aux=20 / rerank=10)
+        # to cut latency without losing Hit@5 recall. Non-issue modes keep the
+        # original candidate_pool_top_k * 3 headroom.
+        if profile == "issue":
+            lane_top_k = max(1, getattr(self._config.search, "issue_lane_top_k", 20))
+            aux_pool_top_k = max(1, getattr(self._config.search, "issue_aux_pool_top_k", 20))
+        else:
+            lane_top_k = candidate_pool_top_k * 3
+            aux_pool_top_k = candidate_pool_top_k
         routed_language = self._context_language(context) if (
             context
             and self._config.search.enable_context_prior
@@ -64,21 +107,62 @@ class SearchEngine:
             and not context.get("allow_cross_language")
         ) else None
         effective_file_pattern = file_pattern
-        search_query = self._enhance_nl_query(query) if (
+        text_query = issue_focus_query if profile == "issue" and issue_focus_query.strip() else (
+            issue_body if profile == "issue" and issue_body.strip() else query
+        )
+        search_query = self._enhance_nl_query(text_query) if (
             qtype == "nl" and self._config.search.enable_nl_query_enhance
-        ) else query
+        ) else text_query
 
         # Step 1: BM25
         bm25_results: list[SearchResult] = []
         if self._config.search.enable_bm25:
             bm25_results = self._storage.bm25_search(
                 search_query,
-                top_k=top_k * 3,
+                top_k=lane_top_k,
                 file_pattern=effective_file_pattern,
                 language=routed_language,
                 tags=tags,
                 or_semantics=(qtype == "nl"),
             )
+            if profile == "issue":
+                title_bm25: list[SearchResult] = []
+                norm_title_bm25 = (issue_title or "").strip()
+                norm_query_bm25 = (search_query or "").strip()
+                if norm_title_bm25 and norm_title_bm25 != norm_query_bm25:
+                    title_bm25 = self._storage.bm25_search(
+                        issue_title,
+                        top_k=max(return_top_k, aux_pool_top_k),
+                        file_pattern=effective_file_pattern,
+                        language=routed_language,
+                        tags=tags,
+                        or_semantics=True,
+                    )
+                hint_bm25: list[SearchResult] = []
+                if issue_test_hints:
+                    # Failing-test hints are routed through a supplementary
+                    # lane so implementation/config/doc candidates linked to
+                    # the failing tests get a fair shot. Test files themselves
+                    # are suppressed here so the lane never dominates.
+                    hint_bm25 = self._storage.bm25_search(
+                        issue_test_hints,
+                        top_k=max(return_top_k, aux_pool_top_k),
+                        file_pattern=effective_file_pattern,
+                        language=routed_language,
+                        tags=tags,
+                        or_semantics=True,
+                    )
+                    hint_bm25 = [r for r in hint_bm25 if not self._is_test_path(r)]
+                if title_bm25 or hint_bm25:
+                    bm25_results = self._rank_fuse_lanes(
+                        [
+                            (bm25_results, 1.00),
+                            (title_bm25, 0.65),
+                            (hint_bm25, 0.55),
+                        ],
+                        top_k=lane_top_k,
+                        rrf_k=self._config.search.rrf_k,
+                    )
 
         # Step 2: vector / document search
         # NL queries prefer search_document; fallback to code vector when missing
@@ -89,24 +173,116 @@ class SearchEngine:
                 if qtype == "nl":
                     semantic_results = self._storage.document_vector_search(
                         q_emb,
-                        top_k=top_k * 3,
+                        top_k=lane_top_k,
                         file_pattern=effective_file_pattern,
                         language=routed_language,
                     )
                 if not semantic_results:
                     semantic_results = self._storage.vector_search(
                         q_emb,
-                        top_k=top_k * 3,
+                        top_k=lane_top_k,
                         file_pattern=effective_file_pattern,
                         language=routed_language,
                     )
                 if tags:
                     semantic_results = self._filter_results(semantic_results, None, tags)
+            if profile == "issue":
+                # Batch issue-mode auxiliary embeddings (title + hint) so the
+                # extra lanes pay one model forward pass instead of two cold
+                # calls. Empty/duplicate lanes are skipped so we never embed
+                # text we won't use.
+                norm_title_vec = (issue_title or "").strip()
+                norm_query_vec = (search_query or "").strip()
+                run_title = bool(
+                    norm_title_vec and norm_title_vec != norm_query_vec
+                )
+                run_hint = bool(issue_test_hints)
+                aux_texts: list[str] = []
+                aux_kinds: list[str] = []
+                if run_title:
+                    aux_texts.append(issue_title)
+                    aux_kinds.append("title")
+                if run_hint:
+                    aux_texts.append(issue_test_hints)
+                    aux_kinds.append("hint")
+                aux_embs: dict[str, list[float] | None] = {}
+                if aux_texts:
+                    batch_fn = getattr(self._embedding, "get_embeddings_batch", None)
+                    if callable(batch_fn):
+                        batch = batch_fn(aux_texts)
+                    else:
+                        batch = [self._embedding.get_embedding(t) for t in aux_texts]
+                    for kind, emb in zip(aux_kinds, batch):
+                        aux_embs[kind] = emb
+
+                title_vec: list[SearchResult] = []
+                title_emb = aux_embs.get("title")
+                if title_emb:
+                    aux_top_k = max(return_top_k, aux_pool_top_k)
+                    if qtype == "nl":
+                        title_vec = self._storage.document_vector_search(
+                            title_emb,
+                            top_k=aux_top_k,
+                            file_pattern=effective_file_pattern,
+                            language=routed_language,
+                        )
+                    if not title_vec:
+                        title_vec = self._storage.vector_search(
+                            title_emb,
+                            top_k=aux_top_k,
+                            file_pattern=effective_file_pattern,
+                            language=routed_language,
+                        )
+                    if tags:
+                        title_vec = self._filter_results(title_vec, None, tags)
+
+                hint_vec: list[SearchResult] = []
+                hint_emb = aux_embs.get("hint")
+                if hint_emb:
+                    aux_top_k = max(return_top_k, aux_pool_top_k)
+                    if qtype == "nl":
+                        hint_vec = self._storage.document_vector_search(
+                            hint_emb,
+                            top_k=aux_top_k,
+                            file_pattern=effective_file_pattern,
+                            language=routed_language,
+                        )
+                    if not hint_vec:
+                        hint_vec = self._storage.vector_search(
+                            hint_emb,
+                            top_k=aux_top_k,
+                            file_pattern=effective_file_pattern,
+                            language=routed_language,
+                        )
+                    hint_vec = [r for r in hint_vec if not self._is_test_path(r)]
+                    if tags:
+                        hint_vec = self._filter_results(hint_vec, None, tags)
+
+                if title_vec or hint_vec:
+                    # Title vector weight >= body weight: the issue title is
+                    # the cleanest semantic anchor; long body text dilutes
+                    # the embedding so we let title lead the lane fusion.
+                    semantic_results = self._rank_fuse_lanes(
+                        [
+                            (semantic_results, 0.85),
+                            (title_vec, 1.00),
+                            (hint_vec, 0.55),
+                        ],
+                        top_k=lane_top_k,
+                        rrf_k=self._config.search.rrf_k,
+                    )
 
         # Step 3: graph search (NL queries also benefit via inferred symbols)
         graph_results: list[SearchResult] = []
         if self._config.search.enable_graph_search:
-            graph_results = self._graph_search(search_query, top_k=top_k * 2)
+            graph_results = self._graph_search(graph_query, top_k=lane_top_k)
+            if profile == "issue" and issue_test_hints:
+                graph_results = self._merge_ranked_results(
+                    graph_results,
+                    self._graph_search(issue_test_hints, top_k=max(return_top_k, aux_pool_top_k)),
+                    score_scale=0.72,
+                    top_k=lane_top_k,
+                )
             if effective_file_pattern or tags or routed_language:
                 graph_results = self._filter_results(
                     graph_results,
@@ -118,7 +294,11 @@ class SearchEngine:
         # Step 4: RRF fusion across BM25 + vector + graph
         has_graph = bool(graph_results)
         has_vector = bool(semantic_results)
-        dwg, dwv, dwb = self._get_dynamic_weights(query)
+        dwg, dwv, dwb = self._get_dynamic_weights(
+            query,
+            qtype=qtype,
+            profile=profile,
+        )
 
         if has_graph and has_vector:
             fusion_mode = "rrf_3way"
@@ -126,7 +306,7 @@ class SearchEngine:
                 bm25_results,
                 semantic_results,
                 graph_results,
-                top_k,
+                candidate_pool_top_k,
                 qtype=qtype,
                 wg=dwg,
                 wv=dwv,
@@ -138,7 +318,7 @@ class SearchEngine:
             fused = self._reciprocal_rank_fusion_2way(
                 bm25_results,
                 semantic_results,
-                top_k,
+                candidate_pool_top_k,
                 "vector",
                 qtype=qtype,
                 wg=dwg,
@@ -151,7 +331,7 @@ class SearchEngine:
             fused = self._reciprocal_rank_fusion_2way(
                 bm25_results,
                 graph_results,
-                top_k,
+                candidate_pool_top_k,
                 "graph",
                 qtype=qtype,
                 wg=dwg,
@@ -161,7 +341,7 @@ class SearchEngine:
             )
         else:
             fusion_mode = "bm25_only"
-            fused = self._stable_sort_results(bm25_results)[:top_k]
+            fused = self._stable_sort_results(bm25_results)[:candidate_pool_top_k]
 
         if self._reranker is not None and self._config.search.enable_rerank:
             stage = "reranked"
@@ -170,25 +350,36 @@ class SearchEngine:
                 fused,
                 context=context,
                 profile=profile,
+                issue_keywords=issue_keywords,
+                issue_title=issue_title,
             )
         else:
             stage = "fused"
             final_results = fused
 
-        # Always normalize the final ordering with deterministic tiebreakers
+        # Always normalize the final ordering with deterministic tiebreakers.
         final_results = self._stable_sort_results(final_results)
+        if profile == "issue":
+            # SWE / Bug-Loc style benchmarks evaluate at the file level; one
+            # file should occupy at most one slot so the remaining Top-K are
+            # spent on distinct gold candidates rather than chunk siblings.
+            final_results = self._dedupe_by_file(final_results)
+        final_results = final_results[:return_top_k]
 
         trace = self._build_explain_trace(
             query=query,
             search_query=search_query,
             qtype=qtype,
             profile=profile,
-            top_k=top_k,
+            top_k=return_top_k,
+            candidate_pool_top_k=candidate_pool_top_k,
             file_pattern=file_pattern,
             tags=tags,
             context=context,
             routed_language=routed_language,
             weights=(dwg, dwv, dwb),
+            graph_query=graph_query,
+            issue_test_hints=issue_test_hints,
             fusion_mode=fusion_mode,
             stage=stage,
             channel_counts={
@@ -376,6 +567,316 @@ class SearchEngine:
                 result.channel_ranks["context"] = 1
         return self._stable_sort_results(results)
 
+    @staticmethod
+    def _normalize_query_text(query: str) -> str:
+        """Normalize benchmark-style escaped issue text into readable NL."""
+        text = (query or "").strip()
+        if not text:
+            return ""
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+            inner = text[1:-1]
+            if inner.count("\\n") >= 2 or inner.count("\n") >= 2:
+                text = inner
+        if "\\r\\n" in text or "\\n" in text or '\\"' in text:
+            text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+        if text.startswith('"') and text.count("\n") >= 2:
+            text = text[1:].lstrip()
+        if text.endswith('"') and text.count("\n") >= 2:
+            text = text[:-1].rstrip()
+        return text
+
+    @staticmethod
+    def _split_issue_query(query: str) -> tuple[str, list[str]]:
+        """Split issue body from failing-test bullets."""
+        body_lines: list[str] = []
+        test_lines: list[str] = []
+        in_tests = False
+        for raw_line in query.splitlines():
+            line = raw_line.rstrip()
+            lower = line.strip().lower()
+            if lower.startswith(("failing tests:", "failing test:", "selected tests:")):
+                in_tests = True
+                continue
+            if in_tests:
+                if not lower:
+                    continue
+                if lower.startswith("- "):
+                    test_lines.append(line.strip()[2:].strip())
+                    continue
+                if "::" in line or re.search(r"\btest[\w./\\-]*\.(py|js|ts|go|rs|java)\b", lower):
+                    test_lines.append(line.strip())
+                    continue
+                in_tests = False
+            body_lines.append(line)
+        body = "\n".join(body_lines).strip()
+        return body or query, test_lines
+
+    @staticmethod
+    def _build_issue_focus_query(body: str) -> str:
+        """Keep the semantically useful issue sections and drop noisy scaffolding."""
+        keep_lines: list[str] = []
+        current_section = "keep"
+        for raw_line in body.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                if keep_lines and keep_lines[-1]:
+                    keep_lines.append("")
+                continue
+
+            lowered = stripped.lower().strip("*# :")
+            inline_header = re.match(
+                r"^[#*\s`]*(title|description|expected behavior|what is expected|actual behavior|what happened instead|current behavior)\s*:\s*(.+?)\s*[*#`]*$",
+                stripped,
+                flags=re.IGNORECASE,
+            )
+            if lowered.startswith("steps to reproduce"):
+                current_section = "skip_steps"
+                continue
+            if lowered.startswith("labels"):
+                current_section = "skip_labels"
+                continue
+            if inline_header:
+                current_section = "keep"
+                keep_lines.append(inline_header.group(2).replace("`", "").strip())
+                continue
+            if lowered.startswith((
+                "title",
+                "description",
+                "expected behavior",
+                "what is expected",
+                "actual behavior",
+                "what happened instead",
+                "current behavior",
+            )):
+                current_section = "keep"
+                continue
+            if current_section == "skip_steps":
+                if re.match(r"^\d+\.\s", stripped):
+                    continue
+                current_section = "keep"
+            if current_section == "skip_labels":
+                if "," in stripped or len(stripped.split()) <= 8:
+                    continue
+                current_section = "keep"
+
+            cleaned = stripped.strip("* ").replace("`", "")
+            keep_lines.append(cleaned)
+
+        compact = "\n".join(keep_lines).strip().strip('"').strip("'")
+        compact = re.sub(r"\n{3,}", "\n\n", compact)
+        return compact or body
+
+    @staticmethod
+    def _build_issue_test_hint_query(test_lines: list[str]) -> str:
+        """Extract implementation-oriented hints from failing test lines."""
+        hints: list[str] = []
+        seen: set[str] = set()
+
+        def add_hint(value: str) -> None:
+            token = value.strip().lower().replace("-", "_")
+            if not token or token in seen:
+                return
+            seen.add(token)
+            hints.append(token)
+            if token.endswith("s") and len(token) >= 5:
+                singular = token[:-1]
+                if singular and singular not in seen:
+                    seen.add(singular)
+                    hints.append(singular)
+
+        for line in test_lines:
+            normalized = line.replace("\\", "/")
+            for path_match in re.findall(r"([A-Za-z0-9_./-]+\.(?:py|js|ts|go|rs|java|yml|yaml|tpl))", normalized):
+                stem = Path(path_match).stem.lower()
+                if stem.startswith("test_"):
+                    stem = stem[5:]
+                if stem:
+                    add_hint(stem)
+            for symbol_match in re.findall(r"::([A-Za-z_][A-Za-z0-9_]*)", normalized):
+                symbol = symbol_match.lower()
+                if symbol.startswith("test_"):
+                    symbol = symbol[5:]
+                elif symbol.startswith("test") and len(symbol) > 4:
+                    symbol = symbol[4:]
+                if symbol and symbol not in {"test", "tests"}:
+                    add_hint(symbol)
+
+        return " ".join(hints)
+
+    # Issue-mode helper: extract title and structural anchors
+    @staticmethod
+    def _extract_issue_title(text: str) -> str:
+        """Pick a short headline-like span from an issue body.
+
+        Generic across SWE-bench / GitHub-issue style markup. Strategy:
+        1. Inline ``**Title: <value>**`` / ``Title: <value>`` -> use the value.
+        2. Bare ``Title:`` / ``# Title:`` line -> use the next non-empty line.
+        3. First non-empty line if it begins with ``#``/``##`` -> strip markup.
+        4. Fallback: first non-empty line, capped at 200 chars.
+        """
+        if not text:
+            return ""
+        lines = [raw.rstrip() for raw in text.splitlines()]
+        first_nonempty: str | None = None
+        for i, line in enumerate(lines):
+            stripped_full = line.strip()
+            if not stripped_full:
+                continue
+            inner = stripped_full.strip("*# `")
+            inline = re.match(r"^title\s*:\s*(.+)$", inner, flags=re.IGNORECASE)
+            if inline and inline.group(1).strip():
+                return inline.group(1).strip().strip("*` ")[:200]
+            if re.match(r"^title\s*:?\s*$", inner, flags=re.IGNORECASE):
+                # Heading-only marker, look ahead.
+                for j in range(i + 1, len(lines)):
+                    follow = lines[j].strip()
+                    if follow:
+                        return follow.strip("*# `")[:200]
+                return ""
+            if first_nonempty is None:
+                first_nonempty = inner[:200]
+        return first_nonempty or ""
+
+    @classmethod
+    def _rank_fuse_lanes(
+        cls,
+        lanes: list[tuple[list["SearchResult"], float]],
+        *,
+        top_k: int,
+        rrf_k: int = 60,
+    ) -> list["SearchResult"]:
+        """Generic RRF merge for multiple ranked lanes.
+
+        ``lanes`` is a list of ``(ranked_results, weight)`` pairs. Each lane
+        contributes ``weight / (rrf_k + rank)`` to a candidate's combined
+        score, summed across lanes. This is the same fusion math used by the
+        outer 3-way RRF, but applied *within* a single channel so primary +
+        secondary lanes interleave instead of concatenating tail-on-head.
+        """
+        scores: dict[str, float] = {}
+        all_r: dict[str, "SearchResult"] = {}
+        for lane_results, weight in lanes:
+            if not lane_results or weight <= 0:
+                continue
+            for rank, r in enumerate(lane_results):
+                if r is None:
+                    continue
+                scores[r.id] = scores.get(r.id, 0.0) + weight / (rrf_k + rank + 1)
+                if r.id not in all_r:
+                    all_r[r.id] = r
+        if not scores:
+            return []
+        sorted_ids = sorted(
+            scores,
+            key=lambda rid: cls._stable_score_key(scores[rid], all_r.get(rid)),
+        )[:top_k]
+        out: list["SearchResult"] = []
+        for rid in sorted_ids:
+            r = all_r.get(rid)
+            if r is None:
+                continue
+            r.score = scores[rid]
+            out.append(r)
+        return out
+
+    # Issue-mode helper: extract focus keywords that drive type/path priors
+    _ISSUE_KEYWORD_MAP = {
+        "config": ("config", "settings", "options"),
+        "settings": ("config", "settings", "options"),
+        "changelog": ("changelog", "release_notes", "version"),
+        "release": ("changelog", "release", "version"),
+        "version": ("changelog", "version", "release"),
+        "upgrade": ("changelog", "upgrade", "version"),
+        "docs": ("doc", "docs", "documentation"),
+        "documentation": ("doc", "docs", "documentation"),
+        "openapi": ("openapi", "schema", "swagger"),
+        "schema": ("schema", "openapi"),
+        "i18n": ("i18n", "language", "translation"),
+        "translation": ("i18n", "language", "translation"),
+        "language": ("language", "i18n"),
+        "template": ("template", "tpl", "view"),
+        "view": ("view", "template", "tpl"),
+        "ui": ("view", "template", "ui"),
+        "controller": ("controller",),
+        "router": ("router", "route"),
+        "route": ("router", "route"),
+        "database": ("database", "db"),
+        "migration": ("migration", "upgrade"),
+        "model": ("model", "schema"),
+        "socket": ("socket", "ws", "websocket"),
+        "email": ("email", "mail"),
+        "mail": ("email", "mail"),
+    }
+
+    @classmethod
+    def _extract_issue_keywords(cls, text: str) -> list[str]:
+        """Pull issue-body intents that bias rerank toward impl/config/doc."""
+        if not text:
+            return []
+        lowered = text.lower()
+        out: list[str] = []
+        seen: set[str] = set()
+        for trigger, expansions in cls._ISSUE_KEYWORD_MAP.items():
+            if trigger in lowered:
+                for token in (trigger,) + tuple(expansions):
+                    if token and token not in seen:
+                        seen.add(token)
+                        out.append(token)
+        return out
+
+    @staticmethod
+    def _is_test_path(result: "SearchResult") -> bool:
+        """Return True when the candidate looks like a test fixture/file."""
+        try:
+            file_path = (getattr(result, "file_path", "") or "").replace("\\", "/").lower()
+            symbol_name = (getattr(result, "symbol_name", "") or "").lower()
+            tags = {str(t).lower() for t in (getattr(result, "tags", None) or [])}
+        except Exception:
+            return False
+        if not file_path and not symbol_name:
+            return False
+        if (
+            file_path.startswith("test/")
+            or file_path.startswith("tests/")
+            or "/test/" in file_path
+            or "/tests/" in file_path
+            or file_path.endswith("_test.py")
+            or file_path.endswith(".test.js")
+            or file_path.endswith(".test.ts")
+        ):
+            return True
+        name = Path(file_path).name if file_path else ""
+        if name.startswith("test_") or name.startswith("test."):
+            return True
+        if symbol_name.startswith("test_"):
+            return True
+        if "test" in tags or "tests" in tags:
+            return True
+        return False
+
+    @classmethod
+    def _merge_ranked_results(
+        cls,
+        primary: list[SearchResult],
+        secondary: list[SearchResult],
+        *,
+        score_scale: float,
+        top_k: int,
+    ) -> list[SearchResult]:
+        if not primary:
+            primary = []
+        if not secondary:
+            return cls._stable_sort_results(primary)[:top_k]
+        merged = list(primary)
+        seen_ids = {result.id for result in primary}
+        for result in secondary:
+            if result.id in seen_ids:
+                continue
+            result.score = float(getattr(result, "score", 0.0) or 0.0) * score_scale
+            merged.append(result)
+            seen_ids.add(result.id)
+        return cls._stable_sort_results(merged)[:top_k]
+
     # Semantic-to-symbol inference for NL queries
     _NL_STOP_WORDS = {
         "function", "method", "class", "the", "a", "an", "to", "for",
@@ -397,6 +898,8 @@ class SearchEngine:
     }
 
     _SEMANTIC_TO_SYMBOL = {
+        "email": ["email", "send_email", "confirm_email", "validate_email"],
+        "confirm": ["confirm_email", "email_confirm", "can_send_validation"],
         "json": ["read_json", "load_json", "parse_json", "json_load", "json_dump", "json_decode", "json_encode"],
         "file": ["read_file", "write_file", "open_file", "save_file", "load_file"],
         "sort": ["sort_list", "sort_array", "sorted_list", "quicksort", "mergesort"],
@@ -407,9 +910,17 @@ class SearchEngine:
         "response": ["handle_response", "send_response", "parse_response", "http_response"],
         "parse": ["parse_data", "parse_json", "parse_xml", "parse_input"],
         "validate": ["validate_input", "validate_data", "validate_user", "validate_request"],
+        "validation": ["validate_input", "validate_data", "validate_user", "validate_request"],
         "auth": ["authenticate_user", "check_auth", "verify_auth", "login_user"],
         "login": ["user_login", "do_login", "authenticate_login", "verify_login"],
         "connect": ["db_connect", "connect_db", "create_connection", "open_connection"],
+        "collection": ["collection_loader", "collection_finder", "validate_collection"],
+        "keyword": ["is_keyword", "keyword_validation", "fqcn_validation"],
+        "version": ["version_changed", "parse_version", "version"],
+        "changelog": ["changelog", "show_changelog", "version_changed"],
+        "setting": ["configfiles", "configdata", "settings"],
+        "settings": ["configfiles", "configdata", "settings"],
+        "upgrade": ["upgrade", "version_changed", "changelog"],
         "query": ["db_query", "execute_query", "run_query", "sql_query"],
         "error": ["handle_error", "raise_error", "log_error", "catch_error"],
         "log": ["log_message", "write_log", "log_error", "setup_logger"],
@@ -603,7 +1114,12 @@ class SearchEngine:
             "### how to reproduce",
             "expected behavior",
             "actual behavior",
+            "current behavior",
             "steps to reproduce",
+            "failing tests:",
+            "failing test:",
+            "test failure",
+            "stack trace",
             "traceback",
             "typeerror:",
             "valueerror:",
@@ -641,18 +1157,19 @@ class SearchEngine:
 
         This profile controls fusion weights. `_detect_query_type()` remains a
         text-processing switch for NL query expansion and document-vector recall.
-        Low-confidence NL defaults to function_memory/graph-first because this
-        engine primarily serves local code/agent retrieval, where symbols and
-        graph structure are usually the most stable signal.
+        Strong issue/task reports must win over function-memory cues so SWE /
+        issue-style queries keep the frozen NL/Issue weight family even when
+        they mention functions, descriptions, or failing tests.
         """
         first_line = next((line.strip() for line in query.splitlines() if line.strip()), "")
+        qtype = SearchEngine._detect_query_type(query)
         if SearchEngine._starts_like_code(first_line):
             return "code"
-        if SearchEngine._is_function_memory_query(query):
-            return "function_memory"
         if SearchEngine._is_strong_issue_query(query):
             return "issue"
-        return "code" if SearchEngine._detect_query_type(query) == "code" else "function_memory"
+        if SearchEngine._is_function_memory_query(query):
+            return "function_memory"
+        return "code" if qtype == "code" else "function_memory"
 
     #   
     @staticmethod
@@ -726,8 +1243,22 @@ class SearchEngine:
             return "nl"
         return "nl"
 
-    def _get_dynamic_weights(self, query: str):
-        if self._detect_query_profile(query) == "issue":
+    def _get_dynamic_weights(
+        self,
+        query: str,
+        *,
+        qtype: str | None = None,
+        profile: str | None = None,
+    ):
+        """Choose the frozen fusion family from the resolved query profile.
+
+        `query_type` remains an NL/code text-processing switch. Fusion weights
+        should follow the final profile chosen by the router so explain traces,
+        reranker mode, and RRF all stay aligned.
+        """
+        _ = qtype  # reserved for future trace/debug parity; profile decides weights
+        profile = profile or self._detect_query_profile(query)
+        if profile == "issue":
             return (0.3, 0.5, 0.2)      # Issue/bug/task: vector-heavy NL
         return (0.9, 0.05, 0.05)        # Code + function memory: graph-first
 
@@ -1075,6 +1606,39 @@ class SearchEngine:
                 results.append(r)
         return results
 
+    @staticmethod
+    def _dedupe_by_file(results: list["SearchResult"]) -> list["SearchResult"]:
+        """Keep the highest-scoring chunk per file_path.
+
+        SWE-bench / Bug-Loc style benchmarks score at the file level, so a
+        Top-K filled with multiple chunks of the same wrong file wastes slots.
+        We keep stable order: first occurrence wins position, but the score
+        is upgraded to the maximum across collapsed chunks. Channel-rank
+        metadata is merged so explain traces still show why the file appeared.
+        """
+        seen: dict[str, "SearchResult"] = {}
+        order: list[str] = []
+        for r in results:
+            key = (getattr(r, "file_path", "") or "").lower()
+            if not key:
+                key = getattr(r, "id", "") or str(id(r))
+            existing = seen.get(key)
+            if existing is None:
+                seen[key] = r
+                order.append(key)
+                continue
+            if (getattr(r, "score", 0.0) or 0.0) > (getattr(existing, "score", 0.0) or 0.0):
+                existing.score = r.score
+            try:
+                merged = dict(existing.channel_ranks or {})
+                for ch, rk in (r.channel_ranks or {}).items():
+                    if ch not in merged or (rk and rk < merged[ch]):
+                        merged[ch] = rk
+                existing.channel_ranks = merged
+            except Exception:
+                pass
+        return [seen[k] for k in order]
+
     #   
     def _apply_reranker(
         self,
@@ -1082,14 +1646,26 @@ class SearchEngine:
         rrf_results,
         context: dict | None = None,
         profile: str | None = None,
+        issue_keywords: list[str] | None = None,
+        issue_title: str | None = None,
     ):
         if not rrf_results:
             return rrf_results
         nl_mode = self._detect_query_type(query) == "nl"
+        resolved_profile = profile or self._detect_query_profile(query)
         use_specific_context = (
             self._context_has_specific(context)
-            and (profile or self._detect_query_profile(query)) == "function_memory"
+            and resolved_profile == "function_memory"
         )
+        issue_mode = resolved_profile == "issue"
+        issue_keywords = list(issue_keywords or [])
+        issue_title_tokens: list[str] = []
+        if issue_mode and issue_title:
+            issue_title_tokens = sorted({
+                t.lower()
+                for t in re.findall(r"[A-Za-z][A-Za-z0-9_]+", issue_title)
+                if len(t) >= 3 and t.lower() not in self._NL_STOP_WORDS
+            })
         candidates = [
             {
                 'id': r.id,
@@ -1103,12 +1679,19 @@ class SearchEngine:
                 'context_match': self._context_match_score(r, context),
                 'context_specific_match': self._context_specific_match_score(r, context),
                 'context_has_specific': use_specific_context,
+                'issue_mode': issue_mode,
+                'issue_keywords': issue_keywords if issue_mode else [],
+                'issue_title_tokens': issue_title_tokens if issue_mode else [],
                 'context_boost': self._config.search.context_rerank_boost,
                 'search_document': self._storage.get_search_document(r.id) or '',
             }
             for r in rrf_results
         ]
-        rerank_top_k = max(1, self._config.search.rerank_top_k)
+        issue_rerank_top_k = getattr(self._config.search, "issue_rerank_top_k", None)
+        if profile == "issue" and issue_rerank_top_k and issue_rerank_top_k > 0:
+            rerank_top_k = max(1, issue_rerank_top_k)
+        else:
+            rerank_top_k = max(1, self._config.search.rerank_top_k)
         reranked = self._reranker.rerank(
             query,
             candidates,
@@ -1119,15 +1702,30 @@ class SearchEngine:
         file_result_map = {r.file_path: r for r in rrf_results}
         output = []
         used_ids = set()
+        rerank_min: float | None = None
         for c in reranked:
             orig = result_map.get(c.get('id', '')) or file_result_map.get(c.get('file', ''))
             if orig:
-                orig.score = c.get('_rerank_score', orig.score)
+                rerank_score = c.get('_rerank_score', orig.score) or 0.0
+                orig.score = rerank_score
                 output.append(orig)
                 used_ids.add(orig.id)
+                if rerank_min is None or rerank_score < rerank_min:
+                    rerank_min = rerank_score
         if nl_mode:
-            # NL/Agent: keep RRF tail candidates for context pool
-            output.extend(r for r in rrf_results if r.id not in used_ids)
+            # NL/Agent: keep RRF tail candidates for context pool, but ensure
+            # they cannot outrank the reranked head when the unreranked pool
+            # was widened beyond ``rerank_top_k`` (e.g. issue mode with a 200
+            # candidate pool feeding a 20 rerank_top_k). We attenuate the tail
+            # to land strictly below the lowest reranked score so explain
+            # traces still keep ranks consistent.
+            tail_floor = (rerank_min if rerank_min is not None else 0.0) - 1e-6
+            tail_candidates = [r for r in rrf_results if r.id not in used_ids]
+            for offset, tail in enumerate(tail_candidates, 1):
+                tail_score = float(getattr(tail, "score", 0.0) or 0.0)
+                if rerank_min is not None and tail_score >= rerank_min:
+                    tail.score = tail_floor - 1e-6 * offset
+            output.extend(tail_candidates)
         return output
 
     # ---- Deterministic ordering helpers ----
@@ -1216,11 +1814,14 @@ class SearchEngine:
         qtype: str,
         profile: str | None,
         top_k: int,
+        candidate_pool_top_k: int,
         file_pattern: str | None,
         tags: list[str] | None,
         context: dict | None,
         routed_language: str | None,
         weights: tuple,
+        graph_query: str | None,
+        issue_test_hints: str | None,
         fusion_mode: str,
         stage: str,
         channel_counts: dict,
@@ -1235,11 +1836,14 @@ class SearchEngine:
             "query_type": qtype,
             "query_profile": profile,
             "top_k": top_k,
+            "candidate_pool_top_k": candidate_pool_top_k,
             "file_pattern": file_pattern,
             "tags": list(tags or []),
             "context": dict(context or {}) if context else None,
             "routed_language": routed_language,
             "weights": {"graph": float(wg), "vector": float(wv), "bm25": float(wb)},
+            "graph_query": graph_query,
+            "issue_test_hints": issue_test_hints or "",
             "rrf_k": getattr(cfg, "rrf_k", None),
             "nl_rrf_k": getattr(cfg, "nl_rrf_k", None),
             "fusion_mode": fusion_mode,

@@ -78,14 +78,16 @@ Do not mix these RepoQA 500 result families:
 |---|---:|---:|---:|---:|---|
 | No context | 0.4930 | 40.0% | 67.4% | 85.4% | Pure query only |
 | Language/path/repo context | 0.6054 | 50.2% | 80.8% | 98.0% | Context soft prior |
-| Language-routed context + context-aware P1 | 0.8735 | 81.4% | 97.4% | 98.8% | Product-context path, 96.6 ms avg |
+| Language-routed context + context-aware P1 | 0.9199 | 86.8% | 98.8% | 98.8% | Product-context path, 101.2 ms avg |
 
 Use `Language-routed context + context-aware P1` when the caller knows the
 active file, current language, repo, or workspace, which is normal for an
 IDE/AI programming integration.
 
-Runtime defaults are `default_top_k=50` and `rerank_top_k=20`. Top150 is a
-diagnostic setting for measuring recall headroom, not the product default.
+Runtime defaults return `default_top_k=50` and rerank `rerank_top_k=20`.
+Ordinary queries use `candidate_pool_top_k=50`; function-memory queries with
+concrete repo/path/module context use `context_candidate_pool_top_k=150`
+internally, still returning only Top50.
 
 ## Recommended Client Contract
 

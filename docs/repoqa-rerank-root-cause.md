@@ -59,10 +59,12 @@ reranking:
 |---|---:|---:|---:|---:|---:|---:|
 | Before: language-routed context | 0.6714 | 57.8% | 85.8% | 98.8% | 6 | 69.8 |
 | After: context-aware P1 | 0.8735 | 81.4% | 97.4% | 98.8% | 6 | 96.6 |
+| After: Rust profile + context pool | 0.9199 | 86.8% | 98.8% | 98.8% | 6 | 101.2 |
 
-Runtime defaults are now `default_top_k=50` and `rerank_top_k=20`. Top150 was
-used only to prove recall headroom; after the fix, Hit@50 and Hit@150 are both
-98.8%.
+Runtime defaults now return `default_top_k=50` and rerank `rerank_top_k=20`.
+Ordinary queries use `candidate_pool_top_k=50`; function-memory queries with
+concrete repo/path/module context use `context_candidate_pool_top_k=150`
+internally, still returning only Top50.
 
 By language after the fix:
 
@@ -71,15 +73,15 @@ By language after the fix:
 | Python | 0.9387 | 90.0% | 99.0% | 1 |
 | Java | 0.8942 | 83.0% | 98.0% | 2 |
 | TypeScript | 0.9567 | 92.0% | 100.0% | 0 |
-| Rust | 0.6636 | 55.0% | 93.0% | 0 |
+| Rust | 0.8954 | 82.0% | 100.0% | 0 |
 | Go | 0.9145 | 87.0% | 97.0% | 3 |
 
 ## Regression Checks
 
 | Check | MRR | P@1 | Hit@10 | Zero hits | Avg ms |
 |---|---:|---:|---:|---:|---:|
-| P1 smoke 100 | 0.9650 | 96.0% | 97.0% | 3 | 42.3 |
-| P1 RAG 500 overall | 0.9710 | 97.0% | 97.2% | 14 | 37.7 |
+| P1 smoke 100 | 0.9950 | 99.0% | 100.0% | 0 | 83.7 |
+| P1 RAG 500 overall | 0.9953 | 99.4% | 99.8% | 1 | 78.2 |
 
 Artifacts:
 
@@ -87,3 +89,4 @@ Artifacts:
 - `F:\codex-cache\benchmarks\repoqa_500_rerank_ab_channel_20260616.json`
 - `F:\codex-cache\benchmarks\repoqa_500_rerank_ab_context_20260616.json`
 - `F:\codex-cache\benchmarks\repoqa_500_context_rerank_fixed_20260616.json`
+- `F:\codex-cache\benchmarks\repoqa_500_rust_context_pool_fixed_20260616.json`
